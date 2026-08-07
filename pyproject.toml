@@ -11,6 +11,8 @@ requires-python = ">=3.11,<3.14"
 license = { text = "MIT" }
 dependencies = []
 
+dependency-groups = {dev = ["pytest>=8"]}
+
 [project.entry-points."hermes_agent.plugins"]
 hermes-prime-bridge = "bridge:register"
 
