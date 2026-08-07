@@ -17,7 +17,7 @@ import logging
 import traceback
 import threading
 from contextlib import redirect_stderr, redirect_stdout
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 

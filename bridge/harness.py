@@ -68,10 +68,14 @@ class BridgeHarness:
         return self._store
 
     def entries(self, kind: str | None = None) -> dict[str, Any]:
+        """Return entries as JSON-safe dicts (id -> {fields})."""
+        from dataclasses import asdict
         s = self._ensure()
         if kind is None:
-            return {k: list(v.keys()) for k, v in s.entries.items()}
-        return {k: v for k, v in s.entries.get(kind, {}).items()}
+            return {k: [asdict(e) for e in v.values()] for k, v in s.entries.items()}
+        if kind not in s.entries:
+            return {}
+        return {eid: asdict(e) for eid, e in s.entries[kind].items()}
 
     def upsert(self, kind: str, title: str, content: str, **kw: Any) -> Any:
         s = self._ensure()

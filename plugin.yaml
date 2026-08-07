@@ -13,7 +13,6 @@ provides_tools:
   - rlm_get
   - rlm_delete
 provides_hooks:
+  - on_session_start
   - on_session_end
   - on_session_reset
-provides_skills:
-  - pk-python

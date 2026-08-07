@@ -4,7 +4,7 @@
 Mirrors prime-agent's "skills are executable Python packages": a skill folder
 may carry ``SKILL.md`` plus an importable Python module exposing ``run(...)``.
 This loader bridges that onto Hermes' existing markdown skill surface, so a
-markdown skill can optionally `g the python backend without a second skill
+markdown skill can optionally use the Python backend without a second skill
 registry.
 """
 
