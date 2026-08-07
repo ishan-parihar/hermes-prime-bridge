@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440" viewBox="0 0 1200 440"
+     role="img" aria-labelledby="m-title m-desc">
+  <title id="m-title">The replaces-not-duplicates contract</title>
+  <desc id="m-desc">Three-tier system map. Top tier reads Hermes Agent capability through the bridge into Prime Agent, with a live vendor submodule as the single source. Bottom tier shows the three decisions: replaced, reused, untouched.</desc>
+
+  <defs>
+    <linearGradient id="span" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4c8bf5"/><stop offset="1" stop-color="#2b64c8"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="440" rx="24" fill="#0b0d10"/>
+  <rect x="16" y="16" width="1168" height="428" fill="none" stroke="#26303a" stroke-width="1.5" rx="14"/>
+
+  <!-- top tier: host -> bridge -> live source -->
+  <g transform="translate(70,48)">
+    <text x="0" y="0" font-family="ui-monospace,Menlo,monospace" font-size="18" fill="#66788a" letter-spacing="1">ONE SOURCE, LIVE</text>
+
+    <!-- Hermes host -->
+    <rect x="60" y="30" width="250" height="70" rx="10" fill="#161d26" stroke="#3a4754"/>
+    <text x="185" y="60" font-family="-apple-system,Segoe UI,sans-serif" font-weight="600" font-size="20" fill="#eef1f4" text-anchor="middle">Hermes Agent</text>
+    <text x="185" y="85" font-family="ui-monospace,Menlo,monospace" font-size="16" fill="#6f8192" text-anchor="middle">plugin surface</text>
+
+    <!-- bridge span -->
+    <rect x="310" y="58" width="210" height="8" rx="4" fill="url(#span)"/>
+    <text x="415" y="48" font-family="ui-monospace,Menlo,monospace" font-size="16" fill="#8fa2b5" text-anchor="middle">pk_* tools facade</text>
+
+    <!-- live vendor -->
+    <rect x="520" y="30" width="290" height="70" rx="10" fill="#10151b" stroke="#2b64c8"/>
+    <text x="635" y="60" font-family="-apple-system,Segoe UI,sans-serif" font-weight="600" font-size="20" fill="#cfe0ff" text-anchor="middle">Prime Agent (live)</text>
+    <text x="645" y="85" font-family="ui-monospace,Menlo,monospace" font-size="16" fill="#7f9ad1" text-anchor="middle">vendor submodule / rlm pkg</text>
+
+    <circle cx="310" cy="62" r="6" fill="#0f141b" stroke="#4c8bf5" stroke-width="2"/>
+    <circle cx="520" cy="62" r="6" fill="#0f141b" stroke="#4c8bf5" stroke-width="2"/>
+  </g>
+
+  <!-- middle tier: replaces not duplicates -->
+  <g transform="translate(70,190)">
+    <text x="0" y="0" font-family="ui-monospace,Menlo,monospace" font-size="18" fill="#66788a" letter-spacing="1">THE CONTRACT</text>
+
+    <!-- three columns -->
+    <g transform="translate(0,28)">
+      <!-- col 1 replaced -->
+      <rect x="0" y="0" width="336" height="150" rx="12" fill="#141a21" stroke="#3a4754"/>
+      <rect x="0" y="0" width="336" height="6" rx="3" fill="#4c8bf5"/>
+      <text x="20" y="34" font-family="-apple-system,Segoe UI,sans-serif" font-weight="700" font-size="22" fill="#4c8bf5">REPLACES</text>
+      <text x="20" y="64" font-family="-apple-system,Segoe UI,sans-serif" font-weight="500" font-size="18" fill="#dde3e9">stateless PTC script runner</text>
+      <text x="20" y="92" font-family="-apple-system,Segoe UI,sans-serif" font-weight="500" font-size="18" fill="#dde3e9">→ persistent pk_kernel</text>
+      <text x="20" y="112" font-family="-apple-system,Segoe UI,sans-serif" font-size="16" fill="#8fa2b5">state survives across turns</text>
+
+      <!-- col 2 reuses -->
+      <rect x="382" y="0" width="336" height="120" rx="10" fill="#0d1117" stroke="#3a4754"/>
+      <rect x="382" y="0" width="336" height="4" rx="2" fill="#2b64c8"/>
+      <text x="402" y="26" font-family="-apple-system,Segoe UI,sans-serif" font-weight="700" font-size="22" fill="#cfe0ff">REUSES</text>
+      <text x="402" y="56" font-family="-apple-system,Segoe UI,sans-serif" font-weight="500" font-size="18" fill="#d6e3e9">subagent_lifecycle</text>
+      <text x="402" y="84" font-family="-apple-system,Segoe UI,sans-serif" font-size="16" fill="#8fa2b5">rlm facade is a call-shape adapter</text>
+      <text x="402" y="104" font-family="-apple-system,Menlo,monospace" font-size="16" fill="#8fa2b5">no second recursion engine</text>
+
+      <!-- col 3 untouched -->
+      <rect x="764" y="0" width="336" height="120" rx="10" fill="#11161d" stroke="#26303a"/>
+      <rect x="764" y="0" width="336" height="4" rx="2" fill="#566b7c"/>
+      <text x="784" y="28" font-family="-apple-system,Segoe UI,sans-serif" font-weight="700" font-size="22" fill="#9aa7b3">UNTOUCHED</text>
+      <text x="784" y="56" font-family="-apple-system,Segoe UI,sans-serif" font-weight="500" font-size="18" fill="#c8d0d8">MCP, cron, gateway, daemons</text>
+      <text x="784" y="84" font-family="-apple-system,Segoe UI,sans-serif" font-size="16" fill="#6f8192">out of scope — a duplicate</text>
+      <text x="784" y="104" font-family="-apple-system,Segoe UI,sans-serif" font-size="16" fill="#6f8192">would add no value</text>
+    </g>
+  </g>
+</svg>
