@@ -47,14 +47,22 @@ The rule, per layer:
 
 ## Quick start (native Hermes, any host)
 
+**One command** — install from any machine that has `curl` and `git`:
+
 ```bash
-# clone with its live submodule, then install
-git clone --recurse-submodules https://github.com/YOU/hermes-prime-bridge.git
+bash <(curl -fsSL https://raw.githubusercontent.com/ishan-parihar/hermes-prime-bridge/main/scripts/install.sh) \
+  https://github.com/ishan-parihar/hermes-prime-bridge.git
+```
+
+The installer finds Hermes home, clones the bridge — **with its live submodule** — into `~/.hermes/plugins/hermes-prime-bridge/`, enables it, and confirms with `hermes doctor`. No repo checkout required on the target host.
+
+Prefer the source over the script? Clone with the submodule and run the installer from it:
+
+```bash
+git clone --recurse-submodules https://github.com/ishan-parihar/hermes-prime-bridge.git
 cd hermes-prime-bridge
 ./scripts/install.sh
 ```
-
-The installer finds Hermes Home, clones the bridge **with submodules** into `~/.hermes/plugins/hermes-prime-bridge/`, enables it, and confirms with `hermes doctor`.
 
 Verify it is live:
 
@@ -91,7 +99,7 @@ This repo is a Python package plus an Hermes directory-plugin wrapper. Tests run
 
 ```bash
 uv sync
-uv run pytest -q      # 11 tests
+uv run pytest -q      # 12 tests
 ```
 
 The root `__init__.py` satisfies both **Hermes' directory-plugin loader** (relative import) and **pytest** (module import) through a single dual-path entry — see `pyproject.toml` for the `--import-mode=importlib` note.
@@ -110,7 +118,7 @@ bridge/
   rlm_facade.py       # RLM call shape over Hermes subagent_lifecycle
   schemas.py          # LLM tool schemas
   pyskill.py          # Python-executable skill support (roadmap)
-tests/                # pytest suite (5 contract + integration)
+tests/                # pytest suite (12 contract + integration)
 vendor/prime-agent    # submodule (pinned)
 scripts/install.sh    # native installer (clone --recurse-submodules)
 scripts/update.sh     # advance the vendored pin

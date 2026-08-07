@@ -39,7 +39,7 @@
 
   <!-- ============ RIGHT: BRIDGE MAP ============ -->
   <g transform="translate(700,48)">
-    <text x="0" y="16" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="18" fill="#66788a" letter-spacing="1">HOW IT JOINTS</text>
+    <text x="0" y="16" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="18" fill="#66788a" letter-spacing="1">HOW IT CONNECTS</text>
 
     <!-- host node (Hermes) -->
     <rect x="0" y="48" width="176" height="66" rx="10" fill="#161d26" stroke="#3a4754"/>
@@ -48,25 +48,26 @@
 
     <!-- live vendor node (Prime) -->
     <rect x="326" y="48" width="172" height="66" rx="8" fill="#10151b" stroke="#2b64c8"/>
-    <text x="422" y="78" font-family="-apple-system,Segoe UI sans-serif" font-weight="600" font-size="20" fill="#cfe0ff" text-anchor="middle">Prime Agent</text>
-    <text x="422" y="102" font-family="ui-monospace,Menlo,monospace" font-size="16" fill="#7f9ad1" text-anchor="middle">live vendor · 87e7a7f1</text>
+    <text x="412" y="78" font-family="-apple-system,Segoe UI,sans-serif" font-weight="600" font-size="20" fill="#cfe0ff" text-anchor="middle">Prime Agent</text>
+    <text x="412" y="102" font-family="ui-monospace,Menlo,monospace" font-size="16" fill="#7f9ad1" text-anchor="middle">live vendor · 87e7a7f1</text>
 
     <!-- the connecting span -->
-    <rect x="176" y="78" width="110" height="6" rx="3" fill="url(#bar)"/>
+    <rect x="176" y="78" width="150" height="6" rx="3" fill="url(#bar)"/>
     <circle cx="176" cy="81" r="7" fill="#0f141b" stroke="#4c8bf5" stroke-width="2"/>
-    <circle cx="286" cy="81" r="7" fill="#0f141b" stroke="#4c8bf5" stroke-width="2"/>
+    <circle cx="326" cy="81" r="7" fill="#0f141b" stroke="#4c8bf5" stroke-width="2"/>
 
     <!-- proof terminal -->
     <rect x="0" y="150" width="458" height="212" rx="12" fill="#0d1117" stroke="#2c3440"/>
     <rect x="12" y="14" width="10" height="10" rx="3" fill="#4c8bf5"/>
-    <text x="210" y="23" font-family="ui-monospace,Menlo,monospace" font-size="16" fill="#6b7c8c" text-anchor="middle">hermes doctor</text>
+    <text x="229" y="23" font-family="ui-monospace,Menlo,monospace" font-size="16" fill="#6b7c8c" text-anchor="middle">hermes doctor</text>
     <g transform="translate(20,54)" font-family="ui-monospace,Menlo,monospace" font-size="16">
       <text x="0" y="0" fill="#9aa7b3">$ ./scripts/install.sh</text>
       <text x="0" y="26" fill="#4aa96c">✓ plugin enabled (git)</text>
       <text x="0" y="52" fill="#4aa96c">✓ prime_kernel toolset live</text>
       <text x="0" y="78" fill="#4aa96c">✓ vendor prime-agent @ 87e7a7f1</text>
       <text x="0" y="104" fill="#8fa2b5">$ hermes doctor → RC 0</text>
-      <rect x="150" y="-4" width="9" height="16" fill="#4c8bf5"/>
+      <text x="0" y="130" fill="#9aa7b3">$ </text>
+      <rect x="20" y="126" width="9" height="16" fill="#4c8bf5"/>
     </g>
   </g>
 </svg>
