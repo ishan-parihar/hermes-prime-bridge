@@ -54,7 +54,51 @@ tests/
 vendor/prime-agent    # submodule (pinned)
 ```
 
-## Install (dev)
+
+## Install (native Hermes, any host)
+
+The repo ships a ready installer at `scripts/install.sh`. It:
+
+- discovers Hermes Home (default `~/.hermes`) and the plugins dir,
+- clones the bridge **with its prime-agent submodule** into
+  `~/.hermes/plugins/hermes-prime-bridge/` (git clone --recurse-submodules so the
+  vendored upstream is an independent, pinned checkout),
+- enables the plugin via `hermes plugins enable`,
+- runs `hermes doctor` and lists the plugin to confirm integration.
+
+```bash
+# from a clone of this repo (defaults to the current working tree)
+./scripts/install.sh
+
+# or from a git remote, on any host native Hermes
+./scripts/install.sh https://github.com/YOU/hermes-prime-bridge.git
+```
+
+After install verify with:
+
+```bash
+hermes plugins list | grep hermes-prime-bridge   # -> enabled, source: git
+hermes tools list                                # -> prime_kernel toolset (🔌 Prime Kernel)
+hermes doctor                                    # -> prime_kernel under Tool Availability
+```
+
+To pull newer Prime Agent at runtime (bridged live-upstream):
+
+```bash
+hermes plugins update hermes-prime-bridge        # updates bridge (git pull)
+cd ~/.hermes/plugins/hermes-prime-bridge && git submodule update --init --recursive
+```
+
+> Reproduces/replaces: the stateless script PTC path and the verbose delegate
+> call, via the stateful kernel and RLM facade — no redundant backend is kept.
+
+## Ensure live-upstream integration
+
+Prime Agent is pulled as a **git submodule** at `vendor/prime-agent`. The
+bridge imports prime-agent's `rlm` package directly from that pinned checkout
+via `bridge/vendor.py`, so new upstream code integrates at install/update time.
+
+
 
 ```bash
 git clone git@github.com:/YOU/hermes-prime-bridge.git
