@@ -114,3 +114,19 @@ hermes tools                   # prime_kernel toolset
 3. `rlm_*` facade over subagent_lifecycle (done - backend-injectable)
 4. `pyskill` executable skills (WIP)
 5. `/refine` evidence-backed auto-update (stub)
+
+
+## Testing
+
+Repo-local venv (pytest required):
+
+```bash
+uv venv .venv --python 3.12
+.venv/bin/python -m pip install -e .
+.venv/bin/python -m pytest -q          # 5 tests: kernel persistence, harness, vendor/rlm
+```
+
+> The repo root `__init__.py` (required by Hermes' directory-plugin loader) makes
+> pytest try to import it as a package, so `pyproject.toml` pins
+> `--import-mode=importlib` and the root module falls back to an absolute import —
+> both Hermes and pytest load the same single implementation.

@@ -16,3 +16,12 @@ hermes-prime-bridge = "bridge:register"
 
 [tool.hatch.build.targets.wheel]
 packages = ["bridge"]
+
+
+[tool.pytest.ini_options]
+# Hermes directory plugins require a root __init__.py (re-exporting register),
+# so pytest must import test modules via their own basename rather than treating
+# the repo root as a package (which would try to import that root __init__.py).
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
+
