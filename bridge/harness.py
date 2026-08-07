@@ -55,14 +55,21 @@ class BridgeHarness:
         if not vendor._HAS_PRIME_RUNTIME:
             raise HarnessError("prime-agent rlm unavailable; harness store disabled.")
         rlm = vendor.require_rlm()
-        # prime-agent's get_harness_state honours env for RLM_HARNESS_STATE_DIR.
-        os.environ.setdefault("RLM_HARNESS_STATE_DIR", str(self._state_dir))
+        # Pass state_dir explicitly instead of relying on ambient RLM_HARNESS_STATE_DIR /
+        # RLM_SESSION_DIR, which may already be set by the hosting runtime (e.g. a prime
+        # kernel). Explicit state_dir keeps the plugin store scoped to its own directory
+        # and immune to host-path aliasing.
         try:
-            self._store = rlm.get_harness_state(global_=(self._scope == "global"))
+            self._store = rlm.get_harness_state(
+                state_dir=str(self._state_dir),
+                global_=(self._scope == "global"),
+            )
         except Exception as exc:
             if self._in_memory:
-                self._store = rlm.get_harness_state(global_=(self._scope == "global"),
-                                                    state_dir=str(self._state_dir))
+                self._store = rlm.get_harness_state(
+                    state_dir=str(self._state_dir),
+                    global_=(self._scope == "global"),
+                )
             else:
                 raise HarnessError(f"harness init: {exc}") from exc
         return self._store

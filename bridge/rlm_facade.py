@@ -90,7 +90,7 @@ class SubagentBackend:
                 goal=goal,
                 role=kw.get("role", "leaf"),
                 model=(model or None),
-                metadata={"source": "hermes-prime-bridge.x", "name": name} if name else {"source": "hermes-prime-bridge.x"},
+                metadata={"source": "hermes-prime-bridge", "name": name} if name else {"source": "hermes-prime-bridge"},
             )
             hermes_handle = self._lifecycle.launch(req)
         except Exception as exc:  # surface a stable handle on failure
