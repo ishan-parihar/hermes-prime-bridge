@@ -1,0 +1,18 @@
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-prime-bridge"
+version = "0.1.0"
+description = "Bridge plugin bringing prime-agent's persistent kernel, harness, and RLM ergonomics into Hermes Agent"
+requires-python = ">=3.11,<3.14"
+license = { text = "MIT" }
+dependencies = []
+
+[project.entry-points."hermes_agent.plugins"]
+hermes-prime-bridge = "bridge:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bridge"]

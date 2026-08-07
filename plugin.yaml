@@ -1,0 +1,20 @@
+
+name: hermes-prime-bridge
+version: 0.1.0
+description: "Bridge plugin: port Prime Agent's persistent IPython kernel control-plane, continual-harness refinement, RLM call ergonomics, and Python-executable skills onto Hermes — replacing stateless PTC and standalone curator duplication."
+author: "bridge"
+
+provides_tools:
+  - pk_kernel
+  - pk_harness
+  - pk_refine
+  - rlm
+  - rlm_list
+  - rlm_get
+  - rlm_delete
+  - rlm_find_models
+provides_hooks:
+  - on_session_end
+  - on_session_reset
+provides_skills:
+  - pk-python
