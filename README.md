@@ -1,18 +1,20 @@
 <p align="center">
-  <img src="./assets/readme/hero.svg" width="100%" alt="hermes-prime-bridge — Prime Agent's persistent kernel, continual harness, and lean subagent calls, live-sourced straight off Prime Agent into Hermes. Replaces, not duplicates.">
+  <img src="./assets/readme/hero.svg" width="100%" alt="hermes-prime-bridge — Prime Agent's persistent kernel and continual harness, live-sourced straight off Prime Agent into Hermes. Replaces, not duplicates.">
 </p>
 
-**hermes-prime-bridge** is a [Hermes Agent](https://github.com/primeintellect-ai/hermes-agent) plugin that ports the strengths of [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) — a stateful kernel, a continual-refinement harness, and ergonomic subagent calls — directly from **live upstream Prime source**. Rather than forking or copy-pasting, the plugin pulls Prime Agent as a pinned submodule at `vendor/prime-agent` and imports its real `rlm` runtime, so upgrades propagate on their own.
+**hermes-prime-bridge** is a [Hermes Agent](https://github.com/primeintellect-ai/hermes-agent) plugin that ports the strengths of [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) — a **stateful kernel** and a **continual-refinement harness** — directly from **live upstream Prime source**. Rather than forking or copy-pasting, the plugin pulls Prime Agent as a pinned submodule at `vendor/prime-agent` and imports its real `rlm` runtime (the harness-state library), so upgrades propagate on their own.
 
 The guiding directive is **replace, never duplicate**: every capability the bridge brings either *replaces* a redundant Hermes path or is an *adapter* over a Hermes-owned backend. It never plants a second, competing engine side-by-side with the thing it touches.
+
+> **v0.2 scope change.** Earlier versions also exposed `rlm` / `rlm_list` / `rlm_get` / `rlm_delete` subagent ergonomics. These have been removed — they were thin call-shape adapters over Hermes' `subagent_lifecycle` and duplicated the existing `delegate_task` tool without adding capability. For subagent work, use `delegate_task`. The bridge now ships only the one capability Hermes lacks natively: a **persistent stateful Python kernel** plus its **continual-harness refinement store**.
 
 ---
 
 ## Why it exists
 
-Hermes is a narrow-waisted, stateless agent: each Python call is a fresh subprocess, tool schemas stay lean, and the "prompt-contract" (PTC) pipeline rebuilds context per message. Prime Agent grew different strengths: a **persistent kernel**, a **continual harness** of versioned prompt / memory / skill / subagent records, and an **`await rlm(...)`** ergonomics for recursive calls.
+Hermes is a narrow-waisted, stateless agent: each Python call is a fresh subprocess, tool schemas stay lean, and the "prompt-contract" (PTC) pipeline rebuilds context per message. Prime Agent grew one strength Hermes lacks: a **persistent kernel** where variables, imports, and intermediate values survive across turns.
 
-This plugin keeps Hermes' architecture intact while importing those strengths as *one* integration surface — a **live** one, so nothing ships as a frozen copy.
+This plugin imports that single strength as *one* integration surface — a **live** one, so nothing ships as a frozen copy.
 
 ---
 
@@ -20,9 +22,8 @@ This plugin keeps Hermes' architecture intact while importing those strengths as
 
 | Prime feature | Hermes today | The bridge replaces it with |
 |---|---|---|
-| **Persistent stateful kernel** | `code_execution_tool` (stateless script-per-call) | `pk_kernel_exec` — kernel state persists across turns |
-| **Continual harness** (`memory/prompt/skill/subagent`) | curator + memory_manager | `pk_harness_*` + `/harness` — versioned, scoped, refinement-ready |
-| **RLM call ergonomics** (`await rlm()`) | verbose delegate/async calls | `rlm` / `rlm_list` / `rlm_get` / `rlm_delete` facade over `subagent_lifecycle` |
+| **Persistent stateful kernel** | `execute_code` (stateless script-per-call) | `pk_kernel_exec` — kernel state persists across turns |
+| **Continual harness** (`memory/prompt/skill/subagent`) | curator + memory_manager | `pk_harness_get` + `pk_refine` + `/harness` — versioned, scoped, refinement-ready |
 | **Python-executable skills** | markdown-first SKILL.md | `pyskill` loader (roadmap) |
 
 Full tour of the code: [`docs/REPLACES.md`](docs/REPLACES.md) records the exact replace-vs-reuse-vs-untouched decision for every surface.
@@ -31,16 +32,15 @@ Full tour of the code: [`docs/REPLACES.md`](docs/REPLACES.md) records the exact 
 
 ## The replaces-not-duplicates contract
 
-
 <p align="center">
-  <img src="./assets/readme/mechanism.svg" width="100%" alt="Diagram: Hermes Agent connects over a bridge facade to the live Prime Agent submodule. Three contracts follow — REPLACES the stateless PTC with the persistent kernel; REUSES the subagent_lifecycle backend via the rlm facade; UNTOUCHED MCP/cron/gateway/daemons.">
+  <img src="./assets/readme/mechanism.svg" width="100%" alt="Diagram: Hermes Agent connects over a bridge facade to the live Prime Agent submodule. The bridge REPLACES the stateless PTC with the persistent kernel; COMPLEMENTS the curator with a scoped harness store; UNTOUCHED: subagents (use delegate_task), MCP, cron, gateway, daemons.">
 </p>
 
 The rule, per layer:
 
-- **One recursion, not two.** The `rlm` facade is a *call-shape adapter* over Hermes' `subagent_lifecycle` — it launches, lists, inspects, and removes through Hermes' own backend. There is never a second subagent engine.
-- **One kernel authority.** The stateful kernel is *the* Python execution path; the stateless script path is considered redundant for interactive work.
-- **Separate memory lanes.** The harness store reads/writes its own scoped JSON; it never mutates Hermes' memory-provider records.
+- **One kernel authority.** The stateful kernel is *the* Python execution path for interactive/stateful work; the stateless script path stays available for batch/RPC tool-calling.
+- **Separate memory lanes.** The harness store reads/writes its own scoped JSON; it never mutates Hermes' memory-provider records (`agentmemory`, `memory` tool, curator).
+- **No duplicate subagent engine.** v0.2 removed the `rlm_*` ergonomics. Use `delegate_task` for subagent work.
 - **Live upstream.** Every Python import of the Prime runtime resolves through `vendor/prime-agent/.../rlm` — a real pinned checkout, not a snapshot — so `git submodule update --remote` pulls new Prime behavior into the bridge.
 
 ---
@@ -74,11 +74,10 @@ hermes doctor                                   # prime_kernel under Tool Availa
 
 From inside an Hermes session the toolset is available to the model:
 
-- `pk_kernel_exec(code)` — run Python in the persistent kernel; state persists across turns.
-- `pk_harness_get` — read back continual-harness entries (memory, prompts, skills, subagents).
-- `pk_refine` — record a small, evidence-backed harness refinement.
-- `rlm` — spawn a subagent; `rlm_list` / `rlm_get` / `rlm_delete` manage handles.
-- Slash commands: `/harness`, `/kernel`.
+- `pk_kernel_exec(code, namespace?)` — run Python in the persistent kernel; state persists across turns.
+- `pk_harness_get(kind, id?)` — read back continual-harness entries (memory, prompts, skills, subagents).
+- `pk_refine(evidence, trigger?)` — record a small, evidence-backed harness refinement.
+- Slash commands: `/harness [list]`, `/kernel [reset|size]`.
 
 ---
 
@@ -86,8 +85,8 @@ From inside an Hermes session the toolset is available to the model:
 
 - [x] **Bridge + installer** — native install via `scripts/install.sh`, live-submodule vendor.
 - [x] **Persistent kernel + harness tools** — state and continual records end-to-end.
-- [x] **rlm facade** — bound to Hermes `subagent_lifecycle`, no second engine.
 - [x] **Replacements documented** — `docs/REPLACES.md` contract.
+- [x] **v0.2: rlm ergonomics removed** — duplicate of `delegate_task` deleted; plugin scope narrowed to the stateful kernel + harness.
 - [ ] **`pyskill` executor** — run Python-backed skills through the existing Hermes skill surface.
 - [ ] **Live-update workflow** — verify `hermes plugins update hermes-prime-bridge` pulls new Prime submodule pin.
 
@@ -99,7 +98,7 @@ This repo is a Python package plus an Hermes directory-plugin wrapper. Tests run
 
 ```bash
 uv sync
-uv run pytest -q      # 12 tests
+uv run pytest -q      # 14 tests
 ```
 
 The root `__init__.py` satisfies both **Hermes' directory-plugin loader** (relative import) and **pytest** (module import) through a single dual-path entry — see `pyproject.toml` for the `--import-mode=importlib` note.
@@ -112,17 +111,16 @@ plugin.yaml           # Hermes directory-plugin manifest (provides_tools / provi
 bridge/
   __init__.py         # register(ctx) re-export
   plugin.py           # register(ctx): tools, hooks, slash commands
-  vendor.py           # import Prime rlm live from vendor submodule
-  kernel.py           # persistent per-session kernel
-  harness.py          # continual-harness store adapter
-  rlm_facade.py       # RLM call shape over Hermes subagent_lifecycle
+  vendor.py           # import Prime rlm live from vendor submodule (harness-state library)
+  kernel.py            # persistent per-session kernel
+  harness.py           # continual-harness store adapter
   schemas.py          # LLM tool schemas
-  pyskill.py          # Python-executable skill support (roadmap)
-tests/                # pytest suite (12 contract + integration)
+  pyskill.py           # Python-executable skill support (roadmap)
+tests/                # pytest suite (14 contract + integration)
 vendor/prime-agent    # submodule (pinned)
 scripts/install.sh    # native installer (clone --recurse-submodules)
 scripts/update.sh     # advance the vendored pin
-docs/REPLACES.md      # replaces / reuses / untouched contract
+docs/REPLACES.md      # replaces / complements / untouched contract
 ```
 
 ---

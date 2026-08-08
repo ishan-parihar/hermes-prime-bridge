@@ -2,16 +2,17 @@
 
 This is the single wiring point. It:
 
-* registers the bridge's model tools under a gated ``prime_kernel`` toolset,
+* registers the bridge's pk tools (pk_kernel_exec, pk_harness_get,
+  pk_refine) under a gated ``prime_kernel`` toolset,
 * registers lifecycle hooks that tear down kernels on session end/reset,
-* registers the RLM-facade backend (binding prime's call shape to Hermes'
-  ``subagent_lifecycle`` when available),
 * exposes ``/pk`` and ``/harness`` slash commands.
 
-Replacement rule: every entry point listed here *replaces* or *extends* an
-existing Hermes surface (stateless PTC -> stateful kernel; standalone delegate
--> RLM-facade over subagent_lifecycle) rather than shipping a duplicated
-backend next to the Hermes one.
+Scope (v0.2.0+): the rlm_* subagent ergonomics have been removed. They
+were a thin call-shape adapter over Hermes' ``subagent_lifecycle`` and
+duplicated ``delegate_task`` without adding capability. Use
+``delegate_task`` for subagent work; the bridge now focuses exclusively
+on the one capability Hermes lacks natively: a stateful Python kernel
+plus its continual-harness refinement store.
 
 Hermes tool contract (tools/registry.py ``dispatch``): a tool handler is
 called as ``handler(args, **kwargs)`` where ``args`` is the argument dict, and
@@ -26,13 +27,13 @@ import json
 import logging
 from typing import Any
 
-from . import harness, kernel, rlm_facade, schemas, vendor
+from . import harness, kernel, schemas, vendor
 
 logger = logging.getLogger(__name__)
 
 
 def _json_default(o: Any) -> Any:
-    """json.dumps default: turn dataclasses (HarnessEntry, RLMHandle, ...) into dicts."""
+    """json.dumps default: turn dataclasses (HarnessEntry, ...) into dicts."""
     from dataclasses import is_dataclass, asdict
     if is_dataclass(o):
         return asdict(o)
@@ -63,7 +64,6 @@ class Bridge:
     def __init__(self) -> None:
         self.kernels = kernel.KernelRegistry()
         self.harness = harness.BridgeHarness()
-        self.subagent = rlm_facade.SubagentBackend()   # backend injected at register
         self._registered = []
 
     # ------- model tool handlers (Hermes arg-dict contract) -------------
@@ -126,42 +126,6 @@ class Bridge:
         except Exception as exc:
             return _err(f"pk_refine: {exc}")
 
-    async def tool_rlm(self, args: dict, **kw: Any) -> str:
-        goal = str(args.get("goal", ""))
-        if not goal.strip():
-            return _err("rlm: 'goal' is required")
-        try:
-            h = await self.subagent.spawn(goal,
-                                          name=str(args.get("name", "")),
-                                          model=str(args.get("model", "")))
-            return _json({"ok": True, "rlm_child_id": h.child_id, "name": h.name,
-                          "model": h.model, "status": h.status})
-        except Exception as exc:
-            return _err(f"rlm: {exc}")
-
-    async def tool_rlm_list(self, args: dict, **kw: Any) -> str:
-        try:
-            items = [{"id": h.child_id, "status": h.status, "name": h.name, "model": h.model}
-                     for h in self.subagent.list()]
-            return _json({"ok": True, "subagents": items})
-        except Exception as exc:
-            return _err(f"rlm_list: {exc}")
-
-    async def tool_rlm_get(self, args: dict, **kw: Any) -> str:
-        child_id = str(args.get("id", ""))
-        h = self.subagent.get(child_id)
-        if h is None:
-            return _err(f"rlm_get: unknown child {child_id}")
-        return _json({"ok": True, "id": h.child_id, "name": h.name, "model": h.model, "status": h.status})
-
-    async def tool_rlm_delete(self, args: dict, **kw: Any) -> str:
-        child_id = str(args.get("id", ""))
-        try:
-            removed = self.subagent.delete(child_id)
-            return _json({"ok": True, "deleted": bool(removed)})
-        except Exception as exc:
-            return _err(f"rlm_delete: {exc}")
-
     # ------- hooks ----------------
     def hook_session_end(self, **kw: Any) -> None:
         logger.info("prime-bridge: session end -> drop kernels")
@@ -205,23 +169,12 @@ _TOOLS = [
     (schemas.PK_KERNEL_EXEC, "tool_pk_kernel_exec"),
     (schemas.PK_HARNESS_GET, "tool_pk_harness_get"),
     (schemas.PK_REFINE, "tool_pk_refine"),
-    (schemas.RLM_SPAWN, "tool_rlm"),
-    (schemas.RLM_LIST, "tool_rlm_list"),
-    (schemas.RLM_GET, "tool_rlm_get"),
-    (schemas.RLM_DELETE, "tool_rlm_delete"),
 ]
 
 
 def register(ctx: Any) -> None:
     """Hermes plugin entry: called after discovery with a PluginContext."""
     bridge = Bridge()
-
-    lifecycle = getattr(ctx, "subagent_lifecycle", None) or getattr(ctx, "delegation", None)
-    if lifecycle is not None:
-        try:
-            bridge.subagent = rlm_facade.SubagentBackend(lifecycle)
-        except Exception as exc:
-            logger.warning("bridge: could not bind subagent lifecycle: %s", exc)
 
     # Tools -> gated toolset, async handlers flagged, results as JSON strings.
     for schema, method in _TOOLS:

@@ -5,8 +5,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-prime-bridge"
-version = "0.1.0"
-description = "Bridge plugin bringing prime-agent's persistent kernel, harness, and RLM ergonomics into Hermes Agent"
+version = "0.2.0"
+description = "Bridge plugin bringing prime-agent's persistent kernel and harness into Hermes Agent (v0.2: rlm ergonomics removed, use delegate_task)"
 requires-python = ">=3.11,<3.14"
 license = { text = "MIT" }
 dependencies = []

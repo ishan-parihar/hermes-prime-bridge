@@ -47,35 +47,3 @@ PK_REFINE = {
         "required": ["evidence"],
     },
 }
-
-RLM_SPAWN = {
-    "name": "rlm",
-    "description": "Spawn a recursive subagent (prime ergonomics) backed by Hermes subagent lifecycle. Returns a handle immediately.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "goal": {"type": "string", "description": "task for the child agent"},
-            "name": {"type": "string", "description": "optional stable child name"},
-            "model": {"type": "string", "description": "optional provider/model selector"},
-        },
-        "required": ["goal"],
-    },
-}
-
-RLM_LIST = {
-    "name": "rlm_list",
-    "description": "List live subagent handles.",
-    "parameters": {"type": "object", "properties": {}},
-}
-
-RLM_GET = {
-    "name": "rlm_get",
-    "description": "Get a child handle / status.",
-    "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
-}
-
-RLM_DELETE = {
-    "name": "rlm_delete",
-    "description": "Cancel and remove a child handle.",
-    "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
-}

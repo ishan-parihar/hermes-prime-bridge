@@ -20,7 +20,6 @@ class FakeContext:
         self.tools = {}
         self.hooks = []
         self.commands = {}
-        self.subagent_lifecycle = None
 
     def register_tool(self, name, toolset, schema, handler, is_async=False,
                       check_fn=None, requires_env=None, description="", emoji="", override=False):
@@ -62,8 +61,7 @@ def _run_async(handler, args):
 def test_register_wires_all_contracts():
     ctx = FakeContext()
     P.register(ctx)
-    expected = {"pk_kernel_exec", "pk_harness_get", "pk_refine",
-                "rlm", "rlm_list", "rlm_get", "rlm_delete"}
+    expected = {"pk_kernel_exec", "pk_harness_get", "pk_refine"}
     assert set(ctx.tools) == expected
     for name in expected:
         assert ctx.tools[name]["is_async"] is True
@@ -90,26 +88,45 @@ def test_kernel_exec_syntax_error_reported():
     assert "SyntaxError" in r["stderr"] or r["stderr"]
 
 
+def test_kernel_exec_namespace_isolation():
+    """Different namespaces are independent."""
+    ctx = FakeContext()
+    P.register(ctx)
+    ctx.dispatch("pk_kernel_exec", {"code": "a = 100", "namespace": "ns1"})
+    ctx.dispatch("pk_kernel_exec", {"code": "a = 200", "namespace": "ns2"})
+    r1 = ctx.dispatch("pk_kernel_exec", {"code": "a", "namespace": "ns1"})
+    r2 = ctx.dispatch("pk_kernel_exec", {"code": "a", "namespace": "ns2"})
+    assert "a" in r1["vars"]
+    assert "a" in r2["vars"]
+
+
+def test_kernel_exec_empty_code_returns_error():
+    ctx = FakeContext()
+    P.register(ctx)
+    r = ctx.dispatch("pk_kernel_exec", {"code": ""})
+    assert r["ok"] is False
+    assert "code" in r["error"]
+
+
 def test_harness_get_missing_runtime_degrades_not_crash():
     # Without prime runtime the harness is disabled -> tool must return JSON even for error
     ctx = FakeContext()
     P.register(ctx)
-    # Force disabled runtime by monkeypatching the vendored flag is invasive; the
-    # tool handler wraps any exception into a JSON error string, which is the contract.
     r = ctx.dispatch("pk_harness_get", {"kind": "memory"})
     assert isinstance(r, dict)  # JSON object, not a crash / coroutine
 
 
-def test_rlm_spawn_without_lifecycle_returns_stable_handle():
-    ctx = FakeContext()
-    P.register(ctx)  # ctx.subagent_lifecycle is None -> degenerate backend
-    r = ctx.dispatch("rlm", {"goal": "do a thing"})
-    assert r["ok"] is True
-    assert r["rlm_child_id"].startswith("loc-")
-
-
-def test_rlm_get_unknown_returns_error():
+def test_pk_refine_requires_evidence():
     ctx = FakeContext()
     P.register(ctx)
-    r = ctx.dispatch("rlm_get", {"id": "nope"})
+    r = ctx.dispatch("pk_refine", {"evidence": ""})
     assert r["ok"] is False
+    assert "evidence" in r["error"]
+
+
+def test_no_rlm_tools_registered():
+    """v0.2: rlm ergonomics removed; the four rlm_* names must NOT be tools."""
+    ctx = FakeContext()
+    P.register(ctx)
+    for name in ("rlm", "rlm_list", "rlm_get", "rlm_delete"):
+        assert name not in ctx.tools, f"{name} should not be registered in v0.2"
