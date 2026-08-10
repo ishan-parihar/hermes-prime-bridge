@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/ishan-parihar/hermes-prime-bridge/actions"><img src="https://img.shields.io/github/actions/workflow/status/ishan-parihar/hermes-prime-bridge/ci.yml?branch=main&style=flat-square&label=CI" alt="CI"></a>
+[![CI](https://github.com/ishan-parihar/hermes-prime-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/ishan-parihar/hermes-prime-bridge/actions/workflows/ci.yml)
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square" alt="MIT"></a>
   <img src="https://img.shields.io/badge/tests-14%20passing-brightgreen?style=flat-square" alt="14 tests passing">
 </p>
