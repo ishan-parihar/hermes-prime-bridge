@@ -1,3 +1,5 @@
+<!-- T2I HERO SPEC — Subject: a bridge — two agent runtimes (Hermes left, Prime right) with a single load-bearing span between them carrying a persistent kernel and a versioned harness; upstream Prime source flows along the span into Hermes, with a fork symbol crossed out. Composition: left-right bridge, glowing traffic, badge reads "replaces, not duplicates". Palette: deep slate #0f172a → violet #8b5cf6 (Hermes) → cyan #22d3ee (Prime), gold #f59e0b for the live flow. Style: flat vector bridge architecture, dark, no text besides motif. 16:9. -->
+
 <p align="center">
   <img src="./assets/readme/hero.svg" width="100%" alt="hermes-prime-bridge — Prime Agent's persistent kernel and continual harness, live-sourced straight off Prime Agent into Hermes. Replaces, not duplicates.">
 </p>
@@ -33,6 +35,18 @@ This plugin imports that single strength as *one* integration surface — a **li
 | **Python-executable skills** | markdown-first SKILL.md | `pyskill` loader (roadmap) |
 
 Full tour of the code: [`docs/REPLACES.md`](docs/REPLACES.md) records the exact replace-vs-reuse-vs-untouched decision for every surface.
+
+## How it compares
+
+| Approach | What it ships | Maintenance | Verdict |
+|---|---|---|---|
+| **hermes-prime-bridge** (this) | Live import of Prime's `rlm` kernel via pinned submodule — one integration surface | Upgrades propagate automatically | ✅ **Replace, never duplicate** |
+| Fork Prime Agent | A second, competing agent beside Hermes | Two codebases to update forever | ❌ duplicates |
+| Copy-paste the kernel | Frozen code that rots | Manual sync of every Prime change | ❌ duplicates |
+| Re-implement in Hermes | Third implementation of statefulness | Most expensive to maintain | ❌ duplicates |
+| Keep Hermes stateless | No persistence — the original gap | None, but gap remains | ⚠️ gap |
+
+Every capability the bridge adds *replaces* a redundant Hermes path or *adapts* a Hermes-owned backend — the directive, enforced in code review, is **never plant a second engine** beside the thing it touches.
 
 ---
 
