@@ -2,6 +2,12 @@
   <img src="./assets/readme/hero.svg" width="100%" alt="hermes-prime-bridge — Prime Agent's persistent kernel and continual harness, live-sourced straight off Prime Agent into Hermes. Replaces, not duplicates.">
 </p>
 
+<p align="center">
+  <a href="https://github.com/ishan-parihar/hermes-prime-bridge/actions"><img src="https://img.shields.io/github/actions/workflow/status/ishan-parihar/hermes-prime-bridge/ci.yml?branch=main&style=flat-square&label=CI" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square" alt="MIT"></a>
+  <img src="https://img.shields.io/badge/tests-14%20passing-brightgreen?style=flat-square" alt="14 tests passing">
+</p>
+
 **hermes-prime-bridge** is a [Hermes Agent](https://github.com/primeintellect-ai/hermes-agent) plugin that ports the strengths of [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) — a **stateful kernel** and a **continual-refinement harness** — directly from **live upstream Prime source**. Rather than forking or copy-pasting, the plugin pulls Prime Agent as a pinned submodule at `vendor/prime-agent` and imports its real `rlm` runtime (the harness-state library), so upgrades propagate on their own.
 
 The guiding directive is **replace, never duplicate**: every capability the bridge brings either *replaces* a redundant Hermes path or is an *adapter* over a Hermes-owned backend. It never plants a second, competing engine side-by-side with the thing it touches.
