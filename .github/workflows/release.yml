@@ -1,21 +1,26 @@
-name: CI
+name: Release
+
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
 
 jobs:
-  gate:
-    name: pytest gate
+  release:
+    name: test + release notes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install (incl. dev group for pytest)
+      - name: Install
         run: |
           pip install uv
           uv sync --group dev --frozen 2>/dev/null || uv sync --group dev
       - name: Test
         run: uv run pytest -q
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
