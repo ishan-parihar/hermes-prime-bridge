@@ -6,6 +6,8 @@
 
 <p align="center">
 <img src="https://img.shields.io/badge/LOC-834-informational?style=flat-square" alt="LOC">
+<img src="https://img.shields.io/badge/Status-Active-brightgreen" alt="Status">
+<img src="https://img.shields.io/badge/Python-3.11-blue?logo=python" alt="Language">
 <a href="https://github.com/ishan-parihar/hermes-prime-bridge/actions/workflows/ci.yml"><img src="https://github.com/ishan-parihar/hermes-prime-bridge/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square" alt="MIT"></a>
   <img src="https://img.shields.io/badge/tests-14%20passing-brightgreen?style=flat-square" alt="14 tests passing">
