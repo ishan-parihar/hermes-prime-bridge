@@ -1,0 +1,2817 @@
+#!/usr/bin/env python3
+"""genome — a project's knowledge genome: one CLI, modules you select.
+
+A fixed set of documentation roles, each with a mutability class, plus the
+machinery that keeps them true: lint, records lifecycle, research evidence,
+home-base housekeeping, multi-agent coordination, and one-call orientation
+(`wake`), retrieval (`ask`) and iteration close (`close`).
+
+Modules (declared in genome.toml `[genome] modules = [...]`; core is always on):
+
+  core      roles, lint, doctor, wake, ask, close, archive, plans, worklog,
+            register, operator questions/rulings, generated zones, budgets
+  records   decisions (AD) and regressions (RG): recon-gated creation,
+            amendments, supersede/merge/retire with an ID map, emitted index
+  research  evidence classes on figures, quarantine register, hypotheses with
+            verdicts and re-open conditions, frozen pre-registrations
+  ops       housekeeping gates: ownership map, links, unreachable code, tracked
+            bulk, secret scan, running-job guard
+  agents    per-workflow boards with claims, the agent feed (mentions inbox)
+
+Profiles (`genome init --profile`): software = core,records · research =
+core,records,research,ops · team = core,records,agents · full = all five.
+
+One file, stdlib only (Python >= 3.11). Finds the project root by walking up
+for genome.toml (or a legacy kb.toml, read unchanged). Exit codes: 0 ok,
+1 usage, 2 lint/gate/claim failure.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import fnmatch
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+# ---------------------------------------------------------------- constants
+
+MODULES = ("core", "records", "research", "ops", "agents")
+PROFILES = {
+    "software": ["core", "records"],
+    "research": ["core", "records", "research", "ops"],
+    "team": ["core", "records", "agents"],
+    "full": list(MODULES),
+}
+LEGACY_MODULES = ["core", "records", "agents"]  # what a kb.toml repo already had
+
+STATUS_VOCAB = ("open", "in-progress", "done", "rejected", "blocked")
+TERMINAL = ("done", "rejected")
+HYP_VOCAB = ("open", "testing", "accepted", "rejected", "parked")
+HYP_TERMINAL = ("accepted", "rejected")
+ASK_VOCAB = ("open", "ruled", "withdrawn")
+CLASSES = ("CERT", "FORWARD", "LIVE", "OUT-OF-SAMPLE", "IN-SAMPLE")
+
+DEFAULT_PATHS = {
+    "agents": "AGENTS.md",
+    "state": "docs/handoff/STATE.md",
+    "entry": "docs/handoff/README.md",
+    "register": "TODO.md",
+    "ledger": "docs/kb/CLOSED.md",
+    "closed": "docs/kb/CLOSED.md",
+    "worklog": "docs/kb/WORKLOG.md",
+    "asks": "docs/kb/ASKS.md",
+    "plans": "docs/plans",
+    "audits": "docs/audit",
+    "runbook": "docs/RUNBOOK.md",
+    "archive": "docs/archive",
+    "readme": "README.md",
+    "docs": "docs",
+    # records
+    "decisions": "docs/decisions",
+    "regressions": "docs/regressions",
+    "records_index": "docs/RECORDS.md",
+    # research
+    "evidence": "evidence",
+    "hypotheses": "docs/kb/HYPOTHESES.md",
+    "quarantine": "docs/kb/QUARANTINE.md",
+    "prereg": "docs/kb/PREREG.md",
+    # ops
+    "ownership_map": "docs/INDEX.md",
+    # agents
+    "feed": "docs/kb/feed.md",
+    "workflows": "docs/kb/workflows",
+}
+MODULE_ROLES = {
+    "core": ["agents", "state", "entry", "register", "ledger", "worklog", "asks", "plans",
+             "audits", "runbook", "archive", "readme", "docs"],
+    "records": ["decisions", "regressions", "records_index"],
+    "research": ["evidence", "hypotheses", "quarantine", "prereg"],
+    "ops": ["ownership_map"],
+    "agents": ["feed", "workflows"],
+}
+APPEND_ONLY = ("ledger", "worklog", "feed", "prereg", "quarantine")
+TOMBSTONE = re.compile(r"<!--\s*kb: tombstone target=\"([^\"]+)\"")
+ZONE_RE = re.compile(r"<!-- genome:zone (\S+) sha=([0-9a-f]+) -->\n(.*?)<!-- genome:end \1 -->", re.S)
+ERR = 2
+MIN_CHUNK = 5  # lines; `ask` hits narrower than this point at a lead line without its content
+VERSION = "2026.10.17-4"
+# every key genome reads: an unknown key is a typo that would silently switch a check off (E017)
+CONFIG_KEYS = {
+    "genome": {"modules"},
+    "core": {"append_window", "archive_form", "ask_days", "ask_globs", "budgets", "checklist", "dated_pattern",
+             "emitters", "gate", "living_plans", "never_commit", "pointer_ignore", "resume", "resume_heading",
+             "resume_lines", "toc_lines", "wake_lines", "worklog_form", "worklog_index", "worklog_width"},
+    "records": {"archive", "mode", "prefix", "recon_hours", "width", "zones", "required", "governed_by"},
+    "research": {"classes", "figure_pattern", "hyp_prefix", "hyp_statuses", "surfaces"},
+    "ops": {"bulk_allow", "bulk_globs", "code_globs", "code_roots", "jobs", "link_prefixes", "link_surfaces",
+            "max_bytes", "owner_exempt", "owner_globs", "py_paths", "secrets", "root_files", "dir_suffixes",
+            "dir_requires", "stale_terms", "stale_exempt", "external_ok"},
+}
+STALE_DOCS = ("*.md", "*.yaml", "*.yml", "*.toml", "*.txt", "*.rst")  # stale paths matter where people read
+SEVERITIES = ("Critical", "High", "Medium", "Low")
+STOP = set("the and for what where which how does did are was were this that with from into when who why "
+           "should can its it's our your about have has not any all".split())
+
+
+def now() -> str:
+    return dt.datetime.now().strftime("%Y-%m-%dT%H:%M")
+
+
+def today() -> str:
+    return dt.datetime.now().strftime("%Y-%m-%d")
+
+
+def die(msg: str, code: int = 1):
+    print(f"genome: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def slugify(s: str, n: int = 60) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:n]
+
+
+def sh(root: Path, *cmd: str, timeout: int = 30) -> str:
+    try:
+        return subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=timeout).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+
+
+def atomic_write(p: Path, text: str) -> None:
+    """Write via a temp file + rename: a crash leaves the old file or the new one, never half of one."""
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.genome-tmp")
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+
+
+def read(p: Path) -> str:
+    try:
+        return p.read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+# ---------------------------------------------------------------- config
+
+class Cfg:
+    """genome.toml (or a legacy kb.toml) resolved against the project root."""
+
+    def __init__(self, root: Path, data: dict, legacy: bool):
+        self.root, self.legacy = root, legacy
+        g = data.get("genome", {})
+        mods = g.get("modules", LEGACY_MODULES if legacy else PROFILES["software"])
+        bad = set(mods) - set(MODULES)
+        if bad:
+            die(f"unknown module(s) in config: {sorted(bad)} (known: {', '.join(MODULES)})")
+        self.modules = {"core", *mods}
+        raw = data.get("paths", {})
+        self.declared = {k for k in raw if isinstance(raw[k], str)}
+        self.zones_declared = "zones" in data.get("records", {})
+        self.paths = {**DEFAULT_PATHS, **{k: v for k, v in raw.items() if isinstance(v, str)}}
+        self.sec = {s: dict(data.get(s, {})) for s in ("core", "records", "research", "ops")}
+        self.unknown = [] if legacy else \
+            [f"[{s}]" for s in data if s not in CONFIG_KEYS and s != "paths"] + \
+            [f"[paths] {k}" for k in raw if k not in DEFAULT_PATHS] + \
+            [f"[{s}] {k}" for s, keys in CONFIG_KEYS.items() if isinstance(data.get(s), dict)
+             for k in data[s] if k not in keys]
+        for k in ("pointer_ignore", "dated_pattern"):  # legacy kb.toml kept these under [paths]
+            if k in raw:
+                self.sec["core"].setdefault(k, raw[k])
+
+    def get(self, sec: str, key: str, default=None):
+        return self.sec.get(sec, {}).get(key, default)
+
+    def form(self, role: str) -> tuple[str, str]:
+        v = self.paths[role]
+        for f in ("overlay", "native"):
+            if v.startswith(f + ":"):
+                return f, v.split(":", 1)[1]
+        return "file", v
+
+    def path(self, role: str) -> Path:
+        """The file a role lives in; a `path#heading` value (a register inside a section of a doc) names that file."""
+        return self.root / self.paths[role].split(":", 1)[-1] if self.form(role)[0] != "file" \
+            else (self.root / self.paths[role].split("#", 1)[0])
+
+    def has(self, role: str) -> bool:
+        return self.form(role)[0] == "file" and self.path(role).exists()
+
+    def require(self, role: str, cmd: str) -> Path:
+        """Writers never follow a pointer note into a literal path."""
+        form, target = self.form(role)
+        if form != "file":
+            die(f"the {role} role is {form}-owned ({target}) — `{cmd}` does not write it here")
+        return self.path(role)
+
+    def need(self, module: str) -> None:
+        if module not in self.modules:
+            die(f"module `{module}` is not enabled — add it to genome.toml [genome] modules")
+
+    def rel(self, p: Path) -> str:
+        try:
+            return p.resolve().relative_to(self.root.resolve()).as_posix()
+        except ValueError:
+            return str(p)
+
+    def globs(self, patterns) -> list[Path]:
+        out: list[Path] = []
+        for g in patterns or []:
+            out += [p for p in self.root.glob(g) if p.is_file()]
+        return sorted(set(out))
+
+    def ignore(self) -> set[str]:
+        v = self.get("core", "pointer_ignore", "")
+        return set(v.split() if isinstance(v, str) else v)
+
+
+def find_cfg(start: Path | None = None) -> Cfg:
+    p = (start or Path.cwd()).resolve()
+    for cand in [p, *p.parents]:
+        for name, legacy in (("genome.toml", False), ("kb.toml", True)):
+            f = cand / name
+            if f.is_file():
+                try:
+                    return Cfg(cand, tomllib.loads(f.read_text()), legacy)
+                except tomllib.TOMLDecodeError as e:
+                    die(f"{f}: {e}")
+    die("no genome.toml upward of cwd — run `genome init` at the project root")
+
+
+# ---------------------------------------------------------------- tables
+
+class Guarded:
+    """flock-guarded read-modify-write: claims and appends race exactly when
+    two agents act at once; the lock makes collisions impossible, not unlikely."""
+
+    def __init__(self, path: Path):
+        self.lock = path.with_name(path.name + ".genome-lock")  # never `*.lock`: Cargo.lock, uv.lock are real files
+
+    def __enter__(self):
+        self.lock.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = open(self.lock, "a+")
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        self.fd.close()
+        return False
+
+
+def cells(line: str) -> list[str]:
+    """Split a table row on unescaped pipes; `\\|` inside a cell (code, regexes) stays in the cell."""
+    body = line.strip()
+    body = body[1:] if body.startswith("|") else body
+    body = body[:-1] if body.endswith("|") and not body.endswith("\\|") else body
+    return [c.strip() for c in re.split(r"(?<!\\)\|", body)]
+
+
+def is_sep(line: str) -> bool:
+    return line.lstrip().startswith("|") and set(line.strip()) <= set("|-: ")
+
+
+def tables(path: Path) -> list[tuple[list[str], list[list[str]]]]:
+    """(header cells, data rows) per markdown table in a file."""
+    lines = read(path).splitlines()
+    out: list[tuple[list[str], list[list[str]]]] = []
+    for i, ln in enumerate(lines):
+        if not ln.lstrip().startswith("|") or is_sep(ln):
+            continue
+        if i + 1 < len(lines) and is_sep(lines[i + 1]):
+            out.append((cells(ln), []))  # header
+        elif out and i and lines[i - 1].lstrip().startswith("|"):
+            out[-1][1].append(cells(ln))
+        else:
+            out.append(([], [cells(ln)]))  # headerless fragment
+    return out
+
+
+def rows(path: Path) -> list[list[str]]:
+    """Data rows of every markdown table in a file (header and separator skipped)."""
+    return [r for _, rs in tables(path) for r in rs]
+
+
+def find_row(path: Path, rid: str) -> list[str] | None:
+    return next((r for r in rows(path) if r and r[0] == rid), None)
+
+
+def fmt_row(row: list[str]) -> str:
+    """One table line: pipes escaped and newlines folded, so a cell can never split the row."""
+    return "| " + " | ".join(re.sub(r"(?<!\\)\|", r"\|", " ".join(str(c).split("\n"))) for c in row) + " |"
+
+
+def replace_row(path: Path, rid: str, new: list[str]) -> bool:
+    lines = read(path).splitlines()
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith("|") and not is_sep(ln) and cells(ln)[0] == rid:
+            lines[i] = fmt_row(new)
+            atomic_write(path, "\n".join(lines) + "\n")
+            return True
+    return False
+
+
+def next_id(path: Path, prefix: str) -> str:
+    nums = [int(m.group(1)) for r in rows(path) if r and (m := re.fullmatch(re.escape(prefix) + r"(\d+)", r[0]))]
+    return f"{prefix}{max(nums, default=0) + 1}"
+
+
+def append_row(path: Path, row: list[str], header: str) -> None:
+    """Add a row after the file's last table line (notes under the table stay under it)."""
+    lines = read(path).splitlines() if path.exists() else header.splitlines()
+    last = max((i for i, ln in enumerate(lines) if ln.lstrip().startswith("|")), default=None)
+    if last is None:
+        last = len(lines) - 1
+    lines.insert(last + 1, fmt_row(row))
+    atomic_write(path, "\n".join(lines) + "\n")
+
+
+class Register:
+    """A register table: a whole file (`path`), or the first table under a heading (`path#heading`), so a repo's
+    existing register (an assumption table inside a protocol doc) stays where it is and keeps its own columns.
+    Columns are found by header name: the first is the id; `status`, `text`, `evidence` and `reopen` by keyword."""
+    COLS = {"status": ("status",), "text": ("hypothes", "assumption", "claim", "question"),
+            "evidence": ("verdict", "evidence"), "reopen": ("reopen", "re-open")}
+
+    def __init__(self, cfg: "Cfg", role: str):
+        self.path = cfg.path(role)
+        self.heading = cfg.paths[role].partition("#")[2]
+        self.load()
+
+    def load(self) -> None:
+        self.lines = read(self.path).splitlines() if self.path.exists() else []
+        lo, hi = 0, len(self.lines)
+        if self.heading:
+            hs = headings(self.lines)
+            hit = next(((k, lv) for k, lv in hs if self.heading.lower() in self.lines[k].lower()), None)
+            if hit is None:
+                die(f"{self.path.name}: no heading containing `{self.heading}` for the register")
+            lo = hit[0]
+            hi = next((k for k, lv in hs if k > lo and lv <= hit[1]), len(self.lines))
+        self.header, self.at = [], []  # header cells; line numbers of the data rows
+        for i in range(lo, hi):
+            ln = self.lines[i]
+            if not ln.lstrip().startswith("|"):
+                if self.header and (self.at or i > self.hdr + 1):
+                    break  # the first table under the heading ends here
+                continue
+            if is_sep(ln):
+                continue
+            if not self.header and i + 1 < hi and is_sep(self.lines[i + 1]):
+                self.header, self.hdr = cells(ln), i
+            elif self.header:
+                self.at.append(i)
+
+    @property
+    def rows(self) -> list[list[str]]:
+        return [cells(self.lines[i]) for i in self.at]
+
+    def col(self, name: str) -> int | None:
+        if name == "id":
+            return 0
+        return next((k for k, h in enumerate(self.header) if any(w in h.lower() for w in self.COLS[name])), None)
+
+    def get(self, row: list[str], name: str) -> str:
+        k = self.col(name)
+        return row[k] if k is not None and k < len(row) else ""
+
+    def find(self, rid: str) -> tuple[int, list[str]] | None:
+        return next(((i, cells(self.lines[i])) for i in self.at if cells(self.lines[i])[0] == rid), None)
+
+    def write(self, i: int | None, row: list[str]) -> None:
+        """Replace line i, or (i None) insert after the register's last row."""
+        row = row + ["—"] * (len(self.header) - len(row))
+        if i is None:
+            self.lines.insert((self.at[-1] if self.at else self.hdr + 1) + 1, fmt_row(row))
+        else:
+            self.lines[i] = fmt_row(row)
+        atomic_write(self.path, "\n".join(self.lines) + "\n")
+        self.load()
+
+    def next_id(self, prefix: str) -> str:
+        nums = [int(m.group(1)) for r in self.rows if (m := re.fullmatch(re.escape(prefix) + r"(\d+)", r[0]))]
+        return f"{prefix}{max(nums, default=0) + 1}"
+
+
+def status_word(cell: str) -> str:
+    """`rejected (ruling 12)` → `rejected`: a register may qualify a status in prose after its first word."""
+    m = re.match(r"[a-z-]+", cell.strip().lower())
+    return m.group(0) if m else ""
+
+
+def evidence_refs(cfg: "Cfg", cell: str) -> tuple[list[str], list[str]]:
+    """(resolving, missing) evidence in a verdict cell: backticked repo paths, and `worklog NNNN` citations
+    (numbered worklogs carry the readings). Backticked commands or symbols are neither."""
+    ok, bad = [], []
+    for t in re.findall(r"`([^`\s]+)`", cell):
+        if "/" in t or re.search(r"\.(json|jsonl|md|csv|parquet|txt|py|log)$", t):
+            p = t.split("#")[0].split("::")[0]
+            hit = (cfg.root / p).exists() or ("/" not in p and cfg.has("evidence")
+                                                and next(cfg.path("evidence").rglob(p), None) is not None)
+            (ok if hit else bad).append(t)
+    if cfg.form("worklog")[0] == "file" and cfg.path("worklog").is_dir():
+        for n in re.findall(r"worklogs? (\d{3,5}[a-z]?)", cell):
+            (ok if next(cfg.path("worklog").glob(f"{n}-*"), None) else bad).append(f"worklog {n}")
+    return ok, bad
+
+
+# ---------------------------------------------------------------- zones
+
+def zone_sha(body: str) -> str:
+    return hashlib.sha256(body.encode()).hexdigest()[:12]
+
+
+def write_zone(path: Path, name: str, body: str) -> bool:
+    """Replace (or append) a generated zone. Returns True when the text changed."""
+    body = body if body.endswith("\n") else body + "\n"
+    block = f"<!-- genome:zone {name} sha={zone_sha(body)} -->\n{body}<!-- genome:end {name} -->"
+    text = read(path)
+    if name in broken_zones(text):
+        die(f"{path}: zone `{name}` has a start marker without its end (or two starts) — repair it by hand, then re-emit")
+    m = next((m for m in ZONE_RE.finditer(text) if m.group(1) == name), None)
+    slot = f"<!-- genome:zone {name} -->"  # a placeholder line places a new zone; otherwise it goes at the end
+    if m:
+        new = text[:m.start()] + block + text[m.end():]
+    elif slot in text:
+        new = text.replace(slot, block, 1)
+    else:
+        new = (text.rstrip("\n") + "\n\n" + block + "\n").lstrip("\n")
+    if new != text:
+        atomic_write(path, new)
+        return True
+    return False
+
+
+def broken_zones(text: str) -> list[str]:
+    starts = re.findall(r"<!-- genome:zone (\S+) sha=", text)
+    whole = {m.group(1) for m in ZONE_RE.finditer(text)}
+    return sorted({n for n in starts if n not in whole or starts.count(n) > 1})
+
+
+def zones(text: str) -> dict[str, tuple[str, str]]:
+    return {m.group(1): (m.group(2), m.group(3)) for m in ZONE_RE.finditer(text)}
+
+
+# ---------------------------------------------------------------- pointers
+
+PTR_BAD = re.compile(r"[<>{}*$…]|\.\.\.|NNNN|://|^[-~/]")
+
+
+FILE_EXT = r"\.(?:md|toml|json|jsonl|yaml|yml|py|sh|txt|csv|mqh|mq5|rs|ts|js|go)"
+
+
+def pointers(text: str, ignore: set[str], prefixes: tuple[str, ...] = ()) -> list[tuple[int, str]]:
+    """Backticked pointers per line: (line, path). A pointer is file-shaped
+    (`dir/name.ext` or `name.ext`), or starts with one of `prefixes` (then any
+    path shape counts, directories included). Globs, placeholders, URLs, git
+    refs (`origin/main`), flags and out-of-repo paths are prose."""
+    out = []
+    for n, ln in enumerate(text.splitlines(), 1):
+        for tok in re.findall(r"`([^`\s]+)`", ln):
+            t = tok.rstrip(".,:;)").split("#")[0].split("::")[0]
+            t = re.sub(r":\d+(-\d+)?$", "", t)
+            if not t or PTR_BAD.search(t) or t in ignore or not re.fullmatch(r"[\w./@+-]+", t):
+                continue
+            if (prefixes and t.startswith(prefixes)) or re.search(FILE_EXT + r"$", t) \
+                    or re.search(FILE_EXT + r"\.[A-Za-z_]\w*$", t) and "/" in t:
+                out.append((n, t))
+    return out
+
+
+def gmatch(path: str, pat: str) -> bool:
+    """Glob with path semantics: `*` within a segment, `**` across segments;
+    a pattern without `/` matches the basename anywhere (gitignore-style)."""
+    if pat.startswith("/"):  # anchored at the project root: `/README.md` is the root README only
+        pat = pat[1:]
+    elif "/" not in pat:
+        return fnmatch.fnmatch(Path(path).name, pat)
+    rx = "".join(".*" if tok == "**/" or tok == "**" else "[^/]*" if tok == "*" else "[^/]" if tok == "?"
+                 else re.escape(tok) for tok in re.findall(r"\*\*/?|\*|\?|[^*?]+", pat))
+    return re.fullmatch(rx, path) is not None
+
+
+def changed_paths(cfg: Cfg) -> list[tuple[str, str]]:
+    """(status, path) for every changed or untracked file — files, never whole dirs; quoting-safe."""
+    raw = sh(cfg.root, "git", "status", "--porcelain", "-z", "--untracked-files=all").split("\0")
+    out, i = [], 0
+    while i < len(raw):
+        ent = raw[i]
+        i += 1
+        if len(ent) < 4:
+            continue
+        out.append((ent[:2], ent[3:]))
+        if ent[0] in "RC":
+            i += 1  # the rename's source path follows
+    return out
+
+
+def tracked(cfg: Cfg) -> list[str]:
+    out = sh(cfg.root, "git", "ls-files").splitlines()
+    if out:
+        return [f for f in out if os.path.lexists(cfg.root / f)]  # moved-but-uncommitted files are gone
+    return [cfg.rel(p) for p in cfg.root.rglob("*") if p.is_file() and ".git" not in p.parts]
+
+
+def pointer_exists(cfg: Cfg, t: str, files: list[str]) -> bool:
+    """Exists at the root, or names a live tracked file by its tail (`name.md`,
+    `src/mod.rs` written relative to a package), or `pkg/module.func`. Archived
+    copies never satisfy a pointer from a live doc."""
+    files = [f for f in files if not is_archived(cfg, f)]
+    if (cfg.root / t).exists():
+        return True
+    mod = re.sub(r"\.[A-Za-z_]\w*$", ".py", t)
+    if "/" in t and (cfg.root / mod).exists():
+        return True
+    tail = "/" + t.rstrip("/")
+    if any(("/" + f).endswith(tail) or (tail + "/") in ("/" + f) for f in files):
+        return True
+    first = "/" + t.split("/")[0] + "/"  # untracked artefact under a tracked dir (e.g. scratch/…)
+    bases = {("/" + f)[:("/" + f).find(first)] for f in files if first in "/" + f}
+    return any((cfg.root / b.lstrip("/") / t).exists() for b in bases)
+
+
+def is_archived(cfg: Cfg, rel: str) -> bool:
+    arch = cfg.paths["archive"].rstrip("/") + "/"
+    return rel.startswith(arch) or "/archive/" in f"/{rel}"
+
+
+# ---------------------------------------------------------------- records
+
+def rec_prefix(cfg: Cfg) -> str:
+    p = cfg.get("records", "prefix", "")
+    return f"{p}-" if p else ""
+
+
+def rec_archive(cfg: Cfg) -> Path:
+    return cfg.root / cfg.get("records", "archive", cfg.paths["archive"].rstrip("/") + "/records")
+
+
+def frontmatter(text: str) -> dict[str, str]:
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---", 4)
+    if end < 0:
+        return {}
+    out = {}
+    for ln in text[4:end].splitlines():
+        m = re.match(r"([A-Za-z][\w-]*):\s*(.*?)\s*$", ln)
+        if m:
+            v = m.group(2)
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1].replace('\\"', '"').replace("\\\\", "\\") if v[0] == '"' else v[1:-1].replace("''", "'")
+            out[m.group(1)] = v
+    return out
+
+
+def yq(v: str) -> str:
+    """A value safe inside a double-quoted YAML scalar on one line."""
+    return " ".join(str(v).split("\n")).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def add_revision(text: str, line: str) -> str:
+    """Append a line to the end of the `## Revisions` section (wherever it sits), or start one at the end."""
+    lines = text.rstrip("\n").splitlines()
+    i = next((k for k, ln in enumerate(lines) if re.match(r"##\s+Revisions\b", ln)), None)
+    if i is None:
+        return "\n".join(lines) + f"\n\n## Revisions\n\n{line}\n"
+    j = next((k for k in range(i + 1, len(lines)) if re.match(r"#{1,2} ", lines[k])), len(lines))
+    while j > i + 1 and not lines[j - 1].strip():
+        j -= 1
+    return "\n".join(lines[:j] + [line] + lines[j:]) + "\n"
+
+
+def set_front(text: str, fields: dict[str, str]) -> str:
+    if not text.startswith("---\n"):
+        text = "---\n---\n\n" + text
+    end = text.find("\n---", 4)
+    head = text[4:end].splitlines()
+    for k, v in fields.items():
+        line = f'{k}: "{yq(v)}"'
+        idx = next((i for i, ln in enumerate(head) if re.match(rf"{re.escape(k)}:", ln)), None)
+        if idx is None:
+            head.append(line)
+        else:
+            head[idx] = line
+    return "---\n" + "\n".join(head) + text[end:]
+
+
+def parse_record(cfg: Cfg, p: Path) -> dict | None:
+    m = re.match(rf"^({re.escape(rec_prefix(cfg))}(AD|RG)-(\d+))", p.name)
+    if not m:
+        return None
+    text = read(p)
+    fm = frontmatter(text)
+    title = fm.get("Title", "")
+    if not title:
+        h = re.search(rf"^#\s+{re.escape(m.group(1))}\s*[:—-]?\s*(.+)$", text, re.M) or re.search(r"^#\s+(.+)$", text, re.M)
+        title = h.group(1).strip() if h else p.stem
+    st = fm.get("Status") or (re.search(r"^[-*\s]*\**Status:?\**:?[ \t]*\**([A-Za-z]+)", text, re.M) or [None, "Active"])[1]
+    return {"id": fm.get("ID", m.group(1)), "kind": m.group(2), "num": int(m.group(3)), "title": title,
+            "status": st, "desc": fm.get("Description", ""), "by": fm.get("SupersededBy") or fm.get("Superseded-By", ""),
+            "sev": fm.get("Severity", ""), "fm": fm, "file_id": m.group(1), "path": p, "text": text}
+
+
+def records(cfg: Cfg, archived: bool = False) -> list[dict]:
+    dirs = [cfg.path("decisions"), cfg.path("regressions")] if not archived else [rec_archive(cfg)]
+    out = []
+    for d in dirs:
+        if d.is_dir():
+            out += [r for f in sorted(d.glob("*.md")) if (r := parse_record(cfg, f))]
+    return out
+
+
+def find_record(cfg: Cfg, rid: str, archived_ok: bool = False) -> dict:
+    for r in records(cfg) + (records(cfg, True) if archived_ok else []):
+        if r["id"] == rid:
+            return r
+    die(f"no record `{rid}`" + ("" if archived_ok else " among active records"))
+
+
+def render_records(cfg: Cfg, kinds: tuple[str, ...] = ("AD", "RG")) -> str:
+    rs = records(cfg)
+    out = []
+    for kind, label in (("AD", "Decisions"), ("RG", "Regressions")):
+        sub = [r for r in rs if r["kind"] == kind]
+        if not sub or kind not in kinds:
+            continue
+        col = "Severity" if kind == "RG" and any(r["sev"] for r in sub) else "Status"
+        out += [f"**{label}** ({len(sub)})", "", f"| ID | Title | {col} | Description |", "|---|---|---|---|"]
+        out += [f"| {r['id']} | {r['title'].replace('|', '/')} | {r['sev'] if col == 'Severity' else r['status']} | "
+                f"{r['desc'][:200].replace('|', '/')} |" for r in sub]
+        out.append("")
+    return "\n".join(out) or "(no records)\n"
+
+
+RENDER = {"records": render_records, "decisions": lambda c: render_records(c, ("AD",)),
+          "regressions": lambda c: render_records(c, ("RG",)), "idmap": lambda c: render_idmap(c)}
+
+
+def render_idmap(cfg: Cfg) -> str:
+    rs = records(cfg, True)
+    if not rs:
+        return "(no retired records)\n"
+    gone = {r["id"]: r["by"] for r in rs}
+    pat = re.compile(rf"{re.escape(rec_prefix(cfg))}(?:AD|RG)-\d+")
+
+    def owner(rid: str) -> str:
+        """Follow SupersededBy through retired records to the live owner: `A → B (via X)`."""
+        by, via = gone[rid], []
+        while (m := pat.match(by or "")) and m.group(0) in gone and m.group(0) not in via and m.group(0) != rid:
+            via.append(m.group(0))
+            by = gone[m.group(0)]
+        return (by or "—") + (f" (via {', '.join(via)})" if via else "")
+
+    out = ["| Retired | Owner now | Status |", "|---|---|---|"]
+    out += [f"| {r['id']} | {owner(r['id'])} | {r['status']} |" for r in rs]
+    return "\n".join(out) + "\n"
+
+
+def record_zone_targets(cfg: Cfg) -> dict[str, list[str]]:
+    z = cfg.get("records", "zones")
+    return z if isinstance(z, dict) else {cfg.paths["records_index"]: ["records", "idmap"]}
+
+
+def emit_records(cfg: Cfg) -> list[str]:
+    changed = []
+    for target, names in record_zone_targets(cfg).items():
+        for n in names:
+            if n not in RENDER:
+                die(f"records.zones: unknown zone `{n}` for {target} (known: {', '.join(RENDER)})")
+            if write_zone(cfg.root / target, n, RENDER[n](cfg)):
+                changed.append(f"{target}#{n}")
+    return changed
+
+
+# ---------------------------------------------------------------- worklog
+
+def worklog_numbered(cfg: Cfg) -> bool:
+    return cfg.get("core", "worklog_form", "file") == "numbered"
+
+
+def worklog_files(cfg: Cfg) -> list[Path]:
+    d = cfg.path("worklog")
+    return sorted(f for f in d.glob("*.md") if re.match(r"\d{3,}", f.name)) if d.is_dir() else []
+
+
+def worklog_index(cfg: Cfg) -> Path:
+    return cfg.path("worklog") / cfg.get("core", "worklog_index", "INDEX.md")
+
+
+def emit_worklog_index(cfg: Cfg) -> bool:
+    return write_zone(worklog_index(cfg), "worklog", render_worklog_index(cfg))
+
+
+def render_worklog_index(cfg: Cfg) -> str:
+    out = ["| File | Date | Title |", "|---|---|---|"]
+    for f in worklog_files(cfg):
+        h = re.search(r"^#\s+(.+)$", read(f), re.M)
+        d = re.search(r"\d{4}-\d{2}-\d{2}", f.name)
+        out.append(f"| `{f.name}` | {d.group(0) if d else '—'} | {(h.group(1) if h else f.stem).replace('|', '/')[:140]} |")
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------- sections / ask
+
+def sections(path: Path) -> list[tuple[str, int, int, str]]:
+    """(heading, start, end, body) per markdown section; code fences respected.
+    Generated zone bodies are blanked (line numbers kept): an emitted table answers no question its source does not."""
+    text = ZONE_RE.sub(lambda m: "\n" * m.group(0).count("\n"), read(path))
+    lines = text.splitlines()
+    out, fence, head, start = [], False, path.name, 1
+    for i, ln in enumerate(lines, 1):
+        if ln.startswith("```"):
+            fence = not fence
+        if not fence and re.match(r"#{1,4} ", ln):
+            if i > start:
+                out.append((head, start, i - 1, "\n".join(lines[start - 1:i - 1])))
+            head, start = ln.lstrip("# ").strip(), i
+    out.append((head, start, len(lines), "\n".join(lines[start - 1:])))
+    return out
+
+
+def stem(t: str) -> str:
+    """Crude suffix folding so quote/quoted/quotes and figure/figures meet."""
+    for suf in ("ations", "ation", "ances", "ance", "ences", "ence", "ings", "ing", "ies", "ied", "ed", "es", "s"):
+        if len(t) >= len(suf) + 3 and t.endswith(suf):  # adding → add, quoted → quot
+            t = t[:-len(suf)] + ("y" if suf in ("ies", "ied") else "")
+            break
+    return t[:-1] if len(t) > 4 and t.endswith("e") else t
+
+
+def toks(s: str) -> set[str]:
+    # short ids with a digit (V1, H1, A28, C0) are the handles of research docs: keep them
+    return {stem(t.strip(".-_")) for t in re.findall(r"[a-z0-9][a-z0-9_.-]*", s.lower())
+            if len(t) >= 3 or re.search(r"\d", t) and re.search(r"[a-z]", t)} - STOP
+
+
+def chunks(path: Path) -> list[tuple[str, int, int, str]]:
+    """Sections, with long ones split at bold lead lines (or every 25 lines), so
+    `ask` can point at a narrow line range instead of a 200-line section."""
+    out = []
+    for h, a, b, body in sections(path):
+        lines = body.splitlines()
+        if len(lines) <= 30:
+            out.append((h, a, b, body))
+            continue
+        cand = [i for i, ln in enumerate(lines) if i and re.match(r"\s*(?:[-*]\s+)?\*\*[^*]{3,}\*\*", ln)]
+        cand = sorted(set(cand + list(range(25, len(lines), 25))))
+        cuts = [0]
+        for c in cand:  # a lead line with its first sub-points: never a one-line hit
+            if c - cuts[-1] >= MIN_CHUNK:
+                cuts.append(c)
+        bold = set(cand) - set(range(25, len(lines), 25))
+        for i, c in enumerate(cuts):
+            e = cuts[i + 1] if i + 1 < len(cuts) else len(lines)
+            if not "".join(lines[c:e]).strip():
+                continue  # a blanked zone
+            # every lead merged into this chunk keeps its lead weight, not only the first
+            leads = [lines[j].strip().strip("-* ")[:60] for j in range(c, e) if j in bold or (j == c and c)]
+            lead = " · ".join(leads)
+            out.append((f"{h} › {lead}" if lead else h, a + c, a + e - 1, "\n".join(lines[c:e])))
+    return out
+
+
+def listed_docs(cfg: Cfg) -> list[Path]:
+    """Docs the ownership map (or the agent contract) points at."""
+    out: dict[Path, Path] = {}
+    for role in ("ownership_map", "agents", "entry"):
+        if cfg.has(role):
+            for _, t in pointers(read(cfg.path(role)), set()):
+                p = cfg.root / t
+                if p.is_file() and p.suffix == ".md":
+                    out.setdefault(p.resolve(), p)
+    return list(out.values())
+
+
+def corpus(cfg: Cfg) -> list[Path]:
+    files = [cfg.path(r) for r in DEFAULT_PATHS if cfg.form(r)[0] == "file" and cfg.path(r).is_file()
+             and cfg.path(r).suffix == ".md"]
+    files += listed_docs(cfg) + [cfg.root / p for p in cfg.get("core", "living_plans", [])]
+    files += cfg.globs(cfg.get("core", "ask_globs", []))
+    if "records" in cfg.modules:
+        files += [r["path"] for r in records(cfg)]
+    seen, out = set(), []
+    for f in files:
+        k = f.resolve()
+        if k not in seen and f.is_file() and f.stat().st_size < 1_500_000 and not is_archived(cfg, cfg.rel(f)):
+            seen.add(k)
+            out.append(f)
+    return out
+
+
+def ask_rank(cfg: Cfg, question: str, k: int = 6) -> list[tuple[float, Path, str, int, int, str]]:
+    q = toks(question)
+    secs = [(f, *s) for f in corpus(cfg) for s in chunks(f)]
+    df: dict[str, int] = {}
+    stoks = []
+    for f, h, a, b, body in secs:
+        head, _, lead = h.partition(" › ")  # a chunk's lead line is body text, not a heading
+        ht, lt, bt, pt = toks(head), toks(lead), toks(body), toks(cfg.rel(f).replace("/", " "))
+        stoks.append((ht, lt, bt, pt))
+        for t in q & (ht | bt):
+            df[t] = df.get(t, 0) + 1
+    n = max(len(secs), 1)
+    scored = []
+    for (f, h, a, b, body), (ht, lt, bt, pt) in zip(secs, stoks):
+        s = sum(math.log(n / (1 + df.get(t, 0))) * (3 * (t in ht) + 1.5 * (t in lt) + (t in bt) + (t in pt)) for t in q)
+        if re.search(r"\b[A-Z]+-(AD|RG)-\d+\b|\b(AD|RG)-\d+\b", question):
+            s += 50 * any(i in body or i in h for i in re.findall(r"\b(?:[A-Z]+-)?(?:AD|RG)-\d+\b", question))
+        if s > 0:
+            scored.append((s, f, h, a, b, body))
+    scored.sort(key=lambda x: -x[0])
+    return scored[:k]
+
+
+def cmd_ask(args) -> None:
+    cfg = find_cfg()
+    q = " ".join(args.question)
+    if cfg.has("agents"):  # routing-table rows whose question cell matches
+        for r in rows(cfg.path("agents")):
+            if len(r) > 1 and len(toks(q) & toks(r[0])) >= 2:
+                print(f"routing  {r[0][:70]} → {r[1][:90]}")
+    hits = ask_rank(cfg, q, args.k)
+    if not hits:
+        print("ask: no section matches — try other words, or `genome ask --k 12`")
+        return
+    qt = toks(q)
+    for s, f, h, a, b, _ in hits:
+        head, _, leads = h.partition(" › ")
+        if leads:  # show the merged lead the question matched, not merely the first
+            h = f"{head[:50]} › " + max(leads.split(" · "), key=lambda ld: len(qt & toks(ld)))
+        print(f"{s:6.1f}  {cfg.rel(f)}:{a}-{b}  § {h[:100]}  ({b - a + 1} lines)")
+    if args.show:
+        _, f, h, a, b, body = hits[0]
+        lines = body.splitlines()
+        print(f"\n--- {cfg.rel(f)}:{a}-{b} ---")
+        print("\n".join(lines[:args.show]))
+        if len(lines) > args.show:
+            print(f"... {len(lines) - args.show} more lines (Read {cfg.rel(f)} offset {a + args.show})")
+
+
+# ---------------------------------------------------------------- lint checks
+
+def lint_core(cfg: Cfg) -> list[str]:
+    out: list[str] = [f"E017 genome.toml: unknown key {k} (a typo here switches a check off silently)"
+                      for k in cfg.unknown]
+    names = tracked(cfg)
+    ign = cfg.ignore()
+    # agent contract pointers
+    if cfg.has("agents"):
+        text = read(cfg.path("agents"))
+        for n, t in pointers(text, ign):
+            if not pointer_exists(cfg, t, names):
+                out.append(f"E001 {cfg.paths['agents']}:{n} points at missing `{t}`")
+            elif "/" in t and (cfg.root / t).is_file() and TOMBSTONE.search(read(cfg.root / t)):
+                out.append(f"E005 {cfg.paths['agents']}:{n} points at a tombstone `{t}`")
+    elif cfg.form("agents")[0] == "file":
+        out.append("W000 no agent contract (AGENTS.md) — the entry point for every future agent")
+    # register
+    if cfg.has("register"):
+        for r in rows(cfg.path("register")):
+            rid, st = r[0], (r[1] if len(r) > 1 else "")
+            if st and st not in STATUS_VOCAB:
+                out.append(f"E002 register {rid}: status `{st}` not in {STATUS_VOCAB}")
+            if st in TERMINAL and (len(r) < 3 or "→ [" not in r[2]):
+                out.append(f"E003 register {rid}: terminal without `→ [YYYY-MM-DD] <evidence>`")
+            if st in TERMINAL and len(r) > 2:
+                for tok in re.findall(r"`([^`]+)`", r[2]):
+                    if "/" in tok and not PTR_BAD.search(tok) and not (cfg.root / tok).exists():
+                        out.append(f"E010 register {rid}: evidence `{tok}` missing")
+    # ledger evidence
+    if cfg.has("ledger"):
+        for n, t in pointers(read(cfg.path("ledger")), ign):
+            if "/" in t and not pointer_exists(cfg, t, names):
+                out.append(f"E009 ledger:{n} cites missing evidence `{t}`")
+    # dated plans/audits
+    pat = re.compile(cfg.get("core", "dated_pattern", "."))
+    living = set(cfg.get("core", "living_plans", []))
+    seen_dirs = set()
+    for role in ("plans", "audits"):
+        d = cfg.path(role)
+        if cfg.form(role)[0] == "file" and d.is_dir() and d.resolve() not in seen_dirs:
+            seen_dirs.add(d.resolve())
+            for f in d.glob("*.md"):
+                if f.name in ("README.md", "INDEX.md"):  # a directory's index is not a plan
+                    continue
+                if cfg.rel(f) not in living and pat.search(f.name) and not re.search(r"\d{4}-\d{2}-\d{2}", f.name):
+                    out.append(f"E004 {role} file without a date stamp: {cfg.rel(f)}")
+    # living plans
+    resume = cfg.get("core", "resume_heading", "Resume here")
+    for lp in living:
+        p = cfg.root / lp
+        if not p.is_file():
+            out.append(f"E001 core.living_plans names missing `{lp}`")
+            continue
+        heads = [h for h, *_ in sections(p)]
+        if section_by_heading(p, resume, 1) is None:
+            out.append(f"W012 living plan {lp} has no '{resume}' section — a resuming agent reads only that")
+        for h in heads:
+            if re.search(r"\bsuperseded\b", h, re.I):
+                out.append(f"W011 living plan {lp}: section '{h[:60]}' is superseded — `genome archive {lp} --section ...`")
+    # generated zones: hand edits
+    zfiles = {f.resolve(): f for f in corpus(cfg) + [cfg.root / t for t in record_zone_targets(cfg)]
+              + ([worklog_index(cfg)] if worklog_numbered(cfg) else [])}
+    for f in zfiles.values():
+        out += [f"E006 {cfg.rel(f)}: zone `{n}` start marker without its end, or duplicated" for n in broken_zones(read(f))]
+        for name, (sha, body) in zones(read(f)).items():
+            if zone_sha(body) != sha:
+                out.append(f"E006 {cfg.rel(f)}: generated zone `{name}` was hand-edited — fix the source, re-emit")
+    # budgets
+    for rel, limit in (cfg.get("core", "budgets", {}) or {}).items():
+        p = cfg.root / rel
+        if p.is_file() and p.stat().st_size > limit:
+            out.append(f"E016 {rel} is {p.stat().st_size} bytes > budget {limit} — move history out, do not add prose")
+    # TOC on long docs
+    toc = cfg.get("core", "toc_lines", 300)
+    for f in listed_docs(cfg):
+        lines = read(f).splitlines()
+        if len(lines) > toc and not re.search(r"^#+\s*(contents|table of contents|toc)\b|\]\(#", read(f), re.I | re.M):
+            out.append(f"W010 {cfg.rel(f)} has {len(lines)} lines and no table of contents (`genome ask` still finds its sections)")
+    # asks / rulings
+    if cfg.has("asks"):
+        days = cfg.get("core", "ask_days", 3)
+        for r in rows(cfg.path("asks")):
+            if len(r) < 6:
+                continue
+            rid, asked, st, _, _, applied = r[:6]
+            if st not in ASK_VOCAB:
+                out.append(f"E013 asks {rid}: status `{st}` not in {ASK_VOCAB}")
+            if st == "ruled" and applied in ("", "—"):
+                out.append(f"W013 asks {rid}: ruling not applied to any owner doc/record (feedback amends its owner the same session)")
+            for t in re.findall(r"`([^`]+)`", applied):
+                if not (cfg.root / t).exists():
+                    out.append(f"E013 asks {rid}: applied-to `{t}` missing")
+            try:
+                age = (dt.date.today() - dt.date.fromisoformat(asked[:10])).days
+            except ValueError:
+                age = 0
+            if st == "open" and age > days:
+                out.append(f"W014 asks {rid}: open for {age} days — re-ask the operator or withdraw it")
+    # numbered worklog
+    if worklog_numbered(cfg):
+        nums: dict[str, list[str]] = {}
+        for f in worklog_files(cfg):
+            nums.setdefault(re.match(r"\d+[a-z]?", f.name).group(0), []).append(f.name)
+        out += [f"E014 worklog number {n} used by {len(v)} files: {', '.join(v)}" for n, v in nums.items() if len(v) > 1]
+        z = zones(read(worklog_index(cfg))).get("worklog")
+        if worklog_files(cfg) and (z is None or z[1] != render_worklog_index(cfg)):
+            out.append(f"E015 {cfg.rel(worklog_index(cfg))}: worklog zone {'absent' if z is None else 'stale'} — `genome emit`")
+    # archive manifests
+    arch = cfg.path("archive")
+    if cfg.form("archive")[0] == "file" and arch.is_dir():
+        if cfg.get("core", "archive_form", "flat") == "generations":
+            for gen in [d for d in arch.iterdir() if d.is_dir()]:
+                man = read(gen / "README.md")
+                if not man:
+                    n = sum(1 for f in gen.rglob("*") if f.is_file())
+                    out.append(f"W007 archive generation {gen.name}/ has no README manifest ({n} files)")
+                    continue
+                for f in gen.rglob("*"):
+                    rel = f.relative_to(gen).as_posix()
+                    parents = [p.as_posix() + "/" for p in Path(rel).parents if p.as_posix() != "."]
+                    if f.is_file() and f.name != "README.md" and rel not in man and f.name not in man \
+                            and not any(p in man for p in parents):
+                        out.append(f"W007 archive {gen.name}/{f.relative_to(gen)} missing from its README manifest")
+        else:
+            idx = read(arch / "INDEX.md")
+            out += [f"W007 archive file not in INDEX.md: {f.name}" for f in arch.glob("*.md")
+                    if f.name != "INDEX.md" and f.name not in idx]
+    # duplicate-question plans (dated form)
+    plans = cfg.path("plans")
+    if cfg.form("plans")[0] == "file" and plans.is_dir():
+        titles = []
+        for f in sorted(plans.glob("*.md")):
+            body = read(f)
+            if "kb: tombstone" in body:
+                continue
+            h = next((ln for ln in body.splitlines() if ln.startswith("#")), "")
+            titles.append((f.name, set(re.findall(r"[a-z0-9]{4,}", h.lower()))))
+        for i in range(len(titles)):
+            for j in range(i + 1, len(titles)):
+                a, b = titles[i][1], titles[j][1]
+                if a and b and len(a & b) / len(a | b) >= 0.5:
+                    out.append(f"W006 plans `{titles[i][0]}` and `{titles[j][0]}` answer the same question — keep one owner")
+    out += lint_outward(cfg)
+    return out
+
+
+def lint_outward(cfg: Cfg) -> list[str]:
+    """W008 README and a docs page answer the same question; W009 unreachable docs page."""
+    out = []
+    readme, docs = cfg.path("readme"), cfg.path("docs")
+    text = read(readme) if readme.is_file() else ""
+    pages = sorted(docs.rglob("*.md")) if docs.is_dir() else []
+    if not (text and pages):
+        return out
+
+    def heads(t, levels=("## ", "### ")):
+        return {re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", "", ln.lstrip("# ").lower())).strip()
+                for ln in t.splitlines() if ln.startswith(levels)} - {""}
+
+    internal = set()
+    for role in DEFAULT_PATHS:
+        if role not in ("readme", "docs") and cfg.form(role)[0] == "file":
+            internal.add(cfg.path(role).resolve())
+    outward = [f for f in pages if not any(f.resolve() == d or d in f.resolve().parents for d in internal)]
+    rh = {h for h in heads(text) if len(h) >= 4}
+    for f in outward:
+        for h in sorted(rh & heads(read(f), ("# ", "## ", "### "))):
+            out.append(f"W008 README and {cfg.rel(f)} both answer '{h}' — the README links, it does not paraphrase")
+    linked = set(re.findall(r"\]\(([^)#\s]+\.md)", text))
+    linked |= {l.split("/", 1)[1] for l in linked if l.startswith(docs.name + "/")}
+    for f in outward:
+        rel = f.relative_to(docs).as_posix()
+        if rel in linked or f.name in linked or rel.lower() in ("readme.md", "index.md"):  # the docs landing page
+            continue
+        if not any(rel in read(p) or f.name in read(p) for p in outward if p != f):
+            out.append(f"W009 docs page not linked from README or any docs page: {rel}")
+    return out
+
+
+def lint_records(cfg: Cfg) -> list[str]:
+    out = []
+    active, gone = records(cfg), records(cfg, True)
+    seen: dict[str, str] = {}
+    for r in active:
+        if r["id"] in seen:
+            out.append(f"E102 record id {r['id']} used twice: {seen[r['id']]} and {cfg.rel(r['path'])}")
+        seen[r["id"]] = cfg.rel(r["path"])
+        if r["status"] in ("Superseded", "Retired"):
+            out.append(f"E103 {cfg.rel(r['path'])} is {r['status']} but still active — `genome rec supersede/retire` moves it")
+        if not r["title"]:
+            out.append(f"E101 {cfg.rel(r['path'])}: no title")
+    known = {r["id"] for r in active + gone}
+    pat = re.compile(rf"\b{re.escape(rec_prefix(cfg))}(?:AD|RG)-\d+\b")
+    for r in active:
+        for cited in set(pat.findall(r["text"])) - known:
+            out.append(f"W105 {r['id']} cites unknown record {cited}")
+    # a retired record has no successor: a live doc citing it cites law that no longer exists
+    hist = tuple(cfg.paths[r].rstrip("/") for r in APPEND_ONLY if cfg.form(r)[0] == "file")
+    for r in gone:
+        if r["status"] == "Retired" and not r["by"]:
+            for f in readers(cfg, r["id"]):
+                if not f.startswith(hist) and f != cfg.rel(r["path"]):
+                    out.append(f"W106 {f} cites retired record {r['id']} (no successor) — drop the citation or cite the owner")
+    # frontmatter contract: the id in the file matches its name; required fields; vocabularies
+    req = cfg.get("records", "required", {})
+    for r in active + gone:
+        rel, fm = cfg.rel(r["path"]), r["fm"]
+        if fm.get("ID") and fm["ID"] != r["file_id"]:
+            out.append(f"E105 {rel}: ID `{fm['ID']}` does not match the file name")
+        if r in active:  # archived records are frozen history: required fields bind live law only
+            out += [f"E105 {rel}: frontmatter `{k}` missing" for k in req.get(r["kind"], []) if not fm.get(k)]
+        if fm.get("Date") and fm["Date"] != "unrecorded" and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", fm["Date"]):
+            out.append(f"E105 {rel}: Date `{fm['Date']}` is not YYYY-MM-DD")
+        if r["sev"] and r["sev"] not in SEVERITIES:
+            out.append(f"E105 {rel}: Severity `{r['sev']}` not in {SEVERITIES}")
+    # supersession is two-sided: a record that supersedes X names a retired X
+    by_id = {r["id"]: r for r in active + gone}
+    for r in active:
+        for t in re.findall(rf"{re.escape(rec_prefix(cfg))}(?:AD|RG)-\d+", r["fm"].get("Supersedes", "")):
+            if t not in by_id:
+                out.append(f"E106 {r['id']} supersedes {t}, which no record or archive holds")
+            elif by_id[t] in active:
+                out.append(f"E106 {r['id']} supersedes {t}, which is still active — `genome rec supersede {t} --by {r['id']}`")
+    # governance map: every active record is named by the doctrine outside its generated zones
+    gov = cfg.get("records", "governed_by")
+    if gov:
+        text = read(cfg.root / gov)
+        for _, (_, body) in zones(text).items():
+            text = text.replace(body, "")
+        for r in active:
+            if not re.search(rf"\b{re.escape(r['id'])}\b", text):
+                out.append(f"E107 {r['id']} is governed by no row of {gov} — name it where its topic lives")
+    for target, names in record_zone_targets(cfg).items():
+        z = zones(read(cfg.root / target))
+        for n in names:
+            want = RENDER[n](cfg) if n in RENDER else ""
+            if n not in RENDER:
+                out.append(f"E104 {target}: unknown zone `{n}` (known: {', '.join(RENDER)})")
+            elif n in z and z[n][1] != want + ("" if want.endswith("\n") else "\n"):
+                out.append(f"E104 {target}: zone `{n}` is stale — `genome rec emit`")
+            elif n not in z and (active or gone) and (not cfg.legacy or cfg.zones_declared):
+                out.append(f"E104 {target}: zone `{n}` absent — `genome rec emit`")
+    return out
+
+
+def figure_re(cfg: Cfg) -> re.Pattern:
+    return re.compile(cfg.get("research", "figure_pattern", r"(?<![\w.])[+\-−]?\d+(?:\.\d+)?\s?%"))
+
+
+def class_re(cfg: Cfg) -> re.Pattern:
+    cl = cfg.get("research", "classes", list(CLASSES))
+    return re.compile(r"\[(" + "|".join(map(re.escape, cl)) + r")\]")
+
+
+def research_surfaces(cfg: Cfg) -> list[Path]:
+    s = cfg.get("research", "surfaces")
+    return cfg.globs(s) if s else [cfg.path(r) for r in ("state", "agents") if cfg.has(r)]
+
+
+def quarantined(cfg: Cfg) -> list[tuple[str, str]]:
+    if not cfg.has("quarantine"):
+        return []
+    # only the figures table: a quarantine file may carry other tables, whose first column is not figures
+    return [(t, r[0]) for h, rs in tables(cfg.path("quarantine")) if not h or re.search(r"figure", h[0], re.I)
+            for r in rs for t in re.findall(r"`([^`]+)`", r[0])]
+
+
+def lint_research(cfg: Cfg) -> list[str]:
+    out = []
+    fig, cls = figure_re(cfg), class_re(cfg)
+    q = quarantined(cfg)
+    qpath = cfg.path("quarantine").resolve()
+    for f in research_surfaces(cfg):
+        text = read(f)
+        for _, (_, body) in zones(text).items():  # blank generated bodies, keep line numbers
+            text = text.replace(body, "\n" * body.count("\n"))
+        for h, a, b, body in sections_text(text):
+            if fig.search(body) and not cls.search(body) and not cls.search(h):
+                n = a + next(i for i, ln in enumerate(body.splitlines()) if fig.search(ln))
+                out.append(f"W201 {cfg.rel(f)}:{n} figure without an evidence class in section '{h[:50]}'")
+        if f.resolve() != qpath:
+            pats = [(t, re.compile(r"(?<![\w.])" + re.escape(t) + r"(?![\w])")) for t, _ in q]
+            for n, ln in enumerate(text.splitlines(), 1):
+                for t, rx in pats:
+                    if rx.search(ln):
+                        out.append(f"E202 {cfg.rel(f)}:{n} quotes quarantined figure `{t}` — strike it")
+    if cfg.has("prereg"):
+        latest: dict[str, list[str]] = {}
+        for r in rows(cfg.path("prereg")):
+            if len(r) >= 3:
+                latest[r[1].strip("`")] = r
+        for spec, r in latest.items():
+            p = cfg.root / spec
+            if not p.is_file():
+                out.append(f"E203 pre-registration `{spec}` is missing")
+            elif r[2].strip("`") not in spec_hashes(p.read_bytes()):
+                out.append(f"E203 pre-registration `{spec}` changed after freezing — revert it, or re-freeze with a reason")
+    if cfg.has("hypotheses"):
+        reg, vocab = Register(cfg, "hypotheses"), hyp_vocab(cfg)
+        for r in reg.rows:
+            if reg.col("status") is None or len(r) < 2:
+                break
+            hid, st = r[0], status_word(reg.get(r, "status"))
+            if st not in vocab:
+                out.append(f"E204 hypothesis {hid}: status `{reg.get(r, 'status')[:40]}` does not start with one of "
+                           f"{vocab} (research.hyp_statuses adds words)")
+            if st in HYP_TERMINAL and reg.col("evidence") is not None:
+                ok, bad = evidence_refs(cfg, reg.get(r, "evidence") + " " + reg.get(r, "status"))
+                if not ok:
+                    out.append(f"E205 hypothesis {hid}: {st} without evidence (a backticked path or `worklog NNNN`)")
+                out += [f"E205 hypothesis {hid}: evidence {e} missing" for e in bad]
+            if st == "rejected" and reg.col("reopen") is not None and reg.get(r, "reopen") in ("", "—"):
+                out.append(f"E206 hypothesis {hid}: rejected without a re-open condition")
+    return out
+
+
+def hyp_vocab(cfg: Cfg) -> tuple[str, ...]:
+    return HYP_VOCAB + tuple(cfg.get("research", "hyp_statuses", []))
+
+
+def sections_text(text: str) -> list[tuple[str, int, int, str]]:
+    lines, out, fence, head, start = text.splitlines(), [], False, "(top)", 1
+    for i, ln in enumerate(lines, 1):
+        if ln.startswith("```"):
+            fence = not fence
+        if not fence and re.match(r"#{1,4} ", ln):
+            out.append((head, start, i - 1, "\n".join(lines[start - 1:i - 1])))
+            head, start = ln.lstrip("# ").strip(), i
+    out.append((head, start, len(lines), "\n".join(lines[start - 1:])))
+    return out
+
+
+def live_surfaces(cfg: Cfg, files: list[str]) -> list[str]:
+    s = {cfg.rel(p) for p in cfg.globs(cfg.get("ops", "link_surfaces", []))}
+    s |= {cfg.rel(p) for p in listed_docs(cfg)}
+    s |= {cfg.paths[r] for r in ("agents", "state", "entry", "ownership_map", "runbook") if cfg.has(r)}
+    roots = cfg.get("ops", "code_roots", [])
+    s |= {f for f in files if any(gmatch(f, g) for g in roots) and not is_archived(cfg, f)}
+    if "records" in cfg.modules:
+        s |= {cfg.rel(r["path"]) for r in records(cfg)}
+    return sorted(s)
+
+
+def lint_ops(cfg: Cfg) -> list[str]:
+    out = []
+    files = tracked(cfg)
+    names = files
+    ign = cfg.ignore()
+    # ownership map: every owner-location doc is listed
+    if cfg.has("ownership_map"):
+        mp = read(cfg.path("ownership_map"))
+        exempt = set(cfg.get("ops", "owner_exempt", []))
+        for g in cfg.get("ops", "owner_globs", []):
+            for f in files:
+                if gmatch(f, g) and f not in exempt and not is_archived(cfg, f) \
+                        and f not in mp and f"`{Path(f).name}`" not in mp:
+                    out.append(f"E301 {f} is in an owner location but not listed in {cfg.paths['ownership_map']}")
+    # links across surfaces
+    for rel in sorted(set(cfg.rel(p) for p in cfg.globs(cfg.get("ops", "link_surfaces", []))) |
+                      ({cfg.paths["ownership_map"]} if cfg.has("ownership_map") else set())):
+        for n, t in pointers(read(cfg.root / rel), ign, tuple(cfg.get("ops", "link_prefixes", []))):
+            if "/" in t and not pointer_exists(cfg, t, names) and not list(cfg.root.glob(t)):
+                out.append(f"E303 {rel}:{n} cites `{t}`, which does not exist")
+    # unreachable code
+    globs = cfg.get("ops", "code_globs", [])
+    if globs:
+        code = [f for f in files if any(gmatch(f, g) for g in globs) and not is_archived(cfg, f)]
+        by_stem: dict[str, list[str]] = {}
+        for f in code:
+            by_stem.setdefault(Path(f).stem, []).append(f)
+        tok = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+        def refs(p: str) -> set[str]:
+            return {c for t in set(tok.findall(read(cfg.root / p))) for c in by_stem.get(t, ())}
+
+        live = live_surfaces(cfg, files)
+        seen: set[str] = set()
+        todo: set[str] = set(live) & set(code)
+        todo |= set().union(*(refs(r) for r in live)) if live else set()
+        while todo:
+            f = todo.pop()
+            if f not in seen:
+                seen.add(f)
+                todo |= refs(f) - seen
+        out += [f"E304 {f} is reachable from no live surface — archive it or cite it from its owner" for f in
+                sorted(set(code) - seen)]
+    out += lint_layout(cfg) + lint_external(cfg)
+    # tracked bulk
+    bulk, big = cfg.get("ops", "bulk_globs", []), cfg.get("ops", "max_bytes", 0)
+    allow = set(cfg.get("ops", "bulk_allow", []))
+    for f in files:
+        if f in allow:
+            continue
+        if any(gmatch(f, g) for g in bulk):
+            out.append(f"E305 {f} is regenerable bulk tracked in git — `git rm --cached` + .gitignore")
+        elif big:
+            try:
+                sz = (cfg.root / f).stat().st_size
+            except OSError:
+                continue
+            if sz > big:
+                out.append(f"E305 {f} is {sz / 1e6:.1f} MB > {big / 1e6:.0f} MB and not in ops.bulk_allow")
+    return out
+
+
+def lint_external(cfg: Cfg) -> list[str]:
+    """A tracked symlink out of the repo makes it depend on one machine and lets outside text steer it."""
+    ok, out = cfg.get("ops", "external_ok", []), []
+    for ln in sh(cfg.root, "git", "ls-files", "-s").splitlines():
+        if not ln.startswith("120000"):
+            continue
+        f = ln.split("\t", 1)[1]
+        try:
+            (cfg.root / f).resolve().relative_to(cfg.root.resolve())
+        except ValueError:
+            if not any(gmatch(f, g) for g in ok):
+                out.append(f"E307 {f} is a symlink out of the repo (-> {os.readlink(cfg.root / f)}): vendor it, "
+                           "remove it, or list it in ops.external_ok")
+    return out
+
+
+def lint_layout(cfg: Cfg) -> list[str]:
+    """Where files may live: root allow-list, per-directory suffixes, required per-directory files, stale terms."""
+    out = []
+    roots, suf = cfg.get("ops", "root_files"), cfg.get("ops", "dir_suffixes", {})
+    req, stale = cfg.get("ops", "dir_requires", {}), cfg.get("ops", "stale_terms", [])
+    if not (roots or suf or req or stale):
+        return out
+    files = [f for f in sh(cfg.root, "git", "ls-files", "-co", "--exclude-standard", "-z").split("\0") if f]
+    files = [f for f in files if (cfg.root / f).is_file()]
+    for f in files:
+        name = f.rsplit("/", 1)[-1]
+        if "truncated" in name or name.startswith("..."):
+            out.append(f"E306 {f}: named like a truncation artefact")
+        if roots is not None and "/" not in f and not name.startswith(".") and name not in roots:
+            out.append(f"E306 {f}: not in ops.root_files (root litter)")
+        key = max((d for d in suf if f.startswith(d.rstrip("/") + "/")), key=len, default=None)
+        if key is not None and suf[key] != "*" and not f.endswith(tuple(suf[key])):
+            out.append(f"E306 {f}: suffix not allowed under {key} ({', '.join(suf[key])})")
+    for pat, need in req.items():
+        for d in sorted(p for p in cfg.root.glob(pat.rstrip("/")) if p.is_dir() and not p.name.startswith((".", "__"))):
+            if not (d / need).exists():
+                out.append(f"E306 {cfg.rel(d)}/ has no {need}")
+    exempt = cfg.get("ops", "stale_exempt", [])
+    for term in stale:
+        rx = re.compile(r"(?<![\w/.-])" + re.escape(term))  # not inside a longer path (its archived copy)
+        for f in sh(cfg.root, "git", "grep", "-l", "-F", "-e", term, "--", *STALE_DOCS).split():
+            if f in ("genome.toml", "kb.toml") or is_archived(cfg, f) or any(gmatch(f, g) for g in exempt) \
+                    or any(f.startswith(cfg.paths[r].rstrip("/") + "/") or f == cfg.paths[r]
+                           for r in APPEND_ONLY if cfg.form(r)[0] == "file"):
+                continue
+            text = read(cfg.root / f)
+            text = re.sub(r"(?ms)^##\s+Revisions\b.*?(?=^##\s|\Z)", "", text)  # revision lines are history
+            if rx.search(text):
+                out.append(f"E306 {f} names the stale path `{term}`")
+    return out
+
+
+def lint_agents(cfg: Cfg) -> list[str]:
+    out = []
+    d = cfg.path("workflows")
+    if cfg.form("workflows")[0] == "file" and d.is_dir():
+        for f in sorted(d.glob("*.md")):
+            for r in rows(f):
+                if len(r) > 3 and r[1] == "in-progress" and not re.search(r"claimed-by `[A-Za-z0-9_.-]+`", r[3]):
+                    out.append(f"E008 {f.name} {r[0]}: in-progress without a well-formed claim (`genome claim`)")
+    return out
+
+
+CHECKS = {"core": lint_core, "records": lint_records, "research": lint_research, "ops": lint_ops,
+          "agents": lint_agents}
+
+
+def run_lint(cfg: Cfg, only: str | None = None) -> list[str]:
+    out = []
+    for mod in MODULES:
+        if mod in cfg.modules and (only is None or only == mod):
+            out += CHECKS[mod](cfg)
+    return out
+
+
+def cmd_lint(args) -> None:
+    cfg = find_cfg()
+    if args.only:
+        cfg.need(args.only)
+    found = run_lint(cfg, args.only)
+    if args.code:
+        found = [f for f in found if f.startswith(tuple(args.code))]
+    errs = [f for f in found if f.startswith("E")]
+    by: dict[str, list[str]] = {}
+    for f in sorted(found, key=lambda s: (s[0] == "E", s)):
+        by.setdefault(f[:4], []).append(f)
+    for code, items in by.items():  # capped per code: lint output is read by agents, every line costs
+        for f in items if args.all else items[:5]:
+            print(f)
+        if not args.all and len(items) > 5:
+            print(f"{code} ... {len(items) - 5} more (`genome lint --code {code} --all`)")
+    print(f"lint: {len(errs)} error(s), {len(found) - len(errs)} warning(s) [{', '.join(sorted(cfg.modules))}]"
+          if found else f"lint: clean [{', '.join(sorted(cfg.modules))}]")
+    raise SystemExit(ERR if errs and not args.advisory else 0)
+
+
+# ---------------------------------------------------------------- doctor
+
+def py_imports(cfg: Cfg, script: Path) -> set[Path]:
+    """Repo files a Python script imports, transitively (resolved from the root and the script's dir).
+    ponytail: static `import`/`from` lines only; importlib and sys.path tricks are not followed."""
+    seen: set[Path] = set()
+    todo = [script]
+    root = cfg.root.resolve()
+    extra = [root / p for p in cfg.get("ops", "py_paths", [])]  # dirs the code puts on sys.path
+    while todo:
+        f = todo.pop()
+        if f in seen or not f.is_file():
+            continue
+        seen.add(f)
+        for m in re.finditer(r"^\s*(?:from\s+(\.*[\w.]*)\s+import\s+([\w, ]+)|import\s+([\w., ]+))", read(f), re.M):
+            mods = [m.group(1)] if m.group(1) is not None else [x.split(" as ")[0].strip() for x in m.group(3).split(",")]
+            subs = [s.strip() for s in (m.group(2) or "").split(",") if s.strip()]
+            for mod in mods:
+                dots = len(mod) - len(mod.lstrip("."))
+                bases = [f.parent.joinpath(*[".."] * (dots - 1)).resolve()] if dots else [root, f.parent, *extra]
+                parts = [p for p in mod.lstrip(".").split(".") if p]
+                for b in bases:
+                    for cand in [parts] + [parts + [s] for s in subs]:
+                        if not cand:
+                            continue
+                        p = b.joinpath(*cand)
+                        for hit in (p.with_suffix(".py"), p / "__init__.py"):
+                            if hit.is_file() and root in hit.resolve().parents:
+                                todo.append(hit.resolve())
+    return seen
+
+
+def running_edits(cfg: Cfg) -> list[str]:
+    """Modified files that a running process executes, or that its Python script imports."""
+    dirty = {p for st, p in changed_paths(cfg) if st != "??"}
+    if not dirty:
+        return []
+    hits: dict[str, tuple[str, set[str]]] = {}  # file → (how, pids): wrappers (shell, timeout) repeat one job
+    root = cfg.root.resolve()
+    for ln in sh(cfg.root, "ps", "-eo", "pid=,args=").splitlines():
+        pid, _, cmd = ln.strip().partition(" ")
+        try:
+            cwd = Path(os.readlink(f"/proc/{pid}/cwd"))
+        except OSError:
+            cwd = root
+        argv = cmd.split()
+        for i, tok in enumerate(argv):
+            if i and argv[i - 1] == "-m":
+                p = cwd.joinpath(*tok.split("."))
+                p = p.with_suffix(".py") if p.with_suffix(".py").is_file() else p / "__main__.py"
+            elif tok.endswith((".py", ".sh")):
+                p = cwd / tok
+            else:
+                continue
+            if not p.is_file() or root not in p.resolve().parents:
+                continue
+            files = py_imports(cfg, p.resolve()) if p.suffix == ".py" else {p.resolve()}
+            for f in sorted(files):
+                rel = cfg.rel(f)
+                if rel in dirty:
+                    how = "executes" if f == p.resolve() else f"imports (via {cfg.rel(p)})"
+                    hits.setdefault(rel, (how, set()))[1].add(pid)
+    return [f"running job edits: {rel} is modified while pid {', '.join(sorted(pids)[:3])} {how} it — "
+            "do not change a running job's code" for rel, (how, pids) in sorted(hits.items())]
+
+
+def doctor_findings(cfg: Cfg) -> tuple[list[str], list[str]]:
+    finds, info = [], []
+    head = sh(cfg.root, "git", "rev-parse", "HEAD").strip()
+    if not head:
+        finds.append("not a git repo — append-only and staleness checks need history")
+    if cfg.has("state") and head:
+        heads = re.findall(r"\b[0-9a-f]{40}\b", read(cfg.path("state")))
+        if heads and heads[0] != head:
+            finds.append(f"stale state: {cfg.paths['state']} names {heads[0][:8]}, HEAD is {head[:8]}")
+    # append-only roles: no line removed over the last core.append_window commits, nor in the working tree.
+    # A numbered worklog is a directory: its entries are append-only (renames allowed), its index is generated.
+    window = int(cfg.get("core", "append_window", 10))
+    base = (sh(cfg.root, "git", "rev-list", f"--max-count={window + 1}", "HEAD").split() or [""])[-1]
+    for role in APPEND_ONLY:
+        if not (cfg.has(role) and head):
+            continue
+        rel = cfg.paths[role].rstrip("/")
+        spec = [rel] + ([f":(exclude){cfg.rel(worklog_index(cfg))}"] if cfg.path(role).is_dir() else [])
+        ranges = [(f"the last {window} commits", [base, "HEAD"])] if base and base != head else []
+        for label, rng in ranges + [("the working tree", ["HEAD"])]:
+            diff = sh(cfg.root, "git", "diff", "-M", "--diff-filter=DM", *rng, "--", *spec)
+            removed = sum(1 for ln in diff.splitlines() if ln.startswith("-") and not ln.startswith("---"))
+            if removed:
+                finds.append(f"append-only violation: {removed} line(s) removed from {rel} in {label}")
+    for mod in sorted(cfg.modules):
+        for role in MODULE_ROLES[mod]:
+            form, target = cfg.form(role)
+            if form != "file":
+                info.append(f"{form}: {role} → {target}")
+            elif role not in ("readme", "docs", "evidence") and not cfg.path(role).exists() \
+                    and (not cfg.legacy or role in cfg.declared):
+                finds.append(f"missing role: {role} ({cfg.paths[role]})")
+    for role in ("state", "entry", "runbook"):
+        if cfg.has(role):
+            age = (dt.datetime.now().timestamp() - cfg.path(role).stat().st_mtime) / 86400
+            if age > 30:
+                finds.append(f"stale {role}: untouched for {age:.0f} days")
+    if cfg.has("asks"):
+        for r in rows(cfg.path("asks")):
+            if len(r) > 5 and r[2] == "ruled" and r[5] in ("", "—"):
+                finds.append(f"ruling {r[0]} not applied to its owner (genome q apply {r[0]} <path>)")
+    finds += running_edits(cfg)
+    d = cfg.path("workflows")
+    if "agents" in cfg.modules and cfg.form("workflows")[0] == "file" and d.is_dir():
+        for f in sorted(d.glob("*.md")):
+            info += [f"live claim {f.stem}: {r[0]} {r[3]}" for r in rows(f) if len(r) > 3 and r[1] == "in-progress"]
+    return finds, info
+
+
+def inventory(cfg: Cfg) -> list[str]:
+    """What an agent needs to decide what to archive next: sizes against budgets, record and history counts."""
+    out = []
+    files = tracked(cfg)
+    size = sum((cfg.root / f).stat().st_size for f in files if (cfg.root / f).is_file())
+    out.append(f"inventory: {len(files)} tracked files, {size / 1e6:.0f} MB")
+    for rel, limit in (cfg.get("core", "budgets", {}) or {}).items():
+        p = cfg.root / rel
+        if p.is_file():
+            out.append(f"budget: {rel} {p.stat().st_size}/{limit} bytes ({100 * p.stat().st_size // limit} %)")
+    if "records" in cfg.modules:
+        act = records(cfg)
+        out.append(f"records: {sum(r['kind'] == 'AD' for r in act)} AD + {sum(r['kind'] == 'RG' for r in act)} RG active, "
+                   f"{len(records(cfg, True))} retired in {cfg.rel(rec_archive(cfg))}")
+    if worklog_numbered(cfg) and (wf := worklog_files(cfg)):
+        out.append(f"worklog: {len(wf)} entries, latest {wf[-1].name}")
+    # a vendored copy drifts from the skill it came from; say so (never auto-update: the repo pins its tool)
+    skill = Path(os.environ.get("GENOME_SKILL", "~/.agents/skills/project-genome/scripts/genome")).expanduser()
+    me = Path(__file__).resolve()
+    if skill.is_file() and skill.resolve() != me and skill.read_bytes() != me.read_bytes():
+        v = re.search(r'^VERSION = "([^"]+)"', read(skill), re.M)
+        out.append(f"upgrade: this genome is {VERSION}, the skill copy is {v.group(1) if v else '?'} — "
+                   f"`cp {skill} {cfg.rel(me)}` after reading its changes")
+    return out
+
+
+def cmd_doctor(args) -> None:
+    cfg = find_cfg()
+    finds, info = doctor_findings(cfg)
+    for i in info + inventory(cfg):
+        print(i)
+    print(f"doctor: {len(finds)} finding(s)" if finds else "doctor: healthy")
+    for f in finds:
+        print(f"  - {f}")
+
+
+# ---------------------------------------------------------------- wake
+
+def headings(lines: list[str]) -> list[tuple[int, int]]:
+    """(index, level) of every markdown heading outside code fences."""
+    out, fence = [], False
+    for k, ln in enumerate(lines):
+        if ln.lstrip().startswith(("```", "~~~")):
+            fence = not fence
+        elif not fence and re.match(r"#{1,6} ", ln):
+            out.append((k, len(ln) - len(ln.lstrip("#"))))
+    return out
+
+
+def section_by_heading(path: Path, needle: str, cap: int) -> tuple[int, list[str]] | None:
+    lines = read(path).splitlines()
+    hs = headings(lines)
+    hit = next(((k, lv) for k, lv in hs if needle.lower() in lines[k].lower()), None)
+    bold = next((k for k, ln in enumerate(lines) if ln.startswith("**") and needle.lower() in ln.lower()), None)
+    if hit is None and bold is None:
+        return None
+    i, lvl = hit if hit is not None and (bold is None or hit[0] < bold) else (bold, 7)
+    j = next((k for k, lv in hs if k > i and lv <= lvl), len(lines))
+    body = lines[i:j]
+    return i + 1, body[:cap] + ([f"... ({len(body) - cap} more lines)"] if len(body) > cap else [])
+
+
+def cmd_wake(args) -> None:
+    """One call, a few kB: everything a resuming agent needs, and where to read next."""
+    cfg = find_cfg()
+    br = sh(cfg.root, "git", "rev-parse", "--abbrev-ref", "HEAD").strip()
+    head = sh(cfg.root, "git", "rev-parse", "--short", "HEAD").strip()
+    dirty = len(sh(cfg.root, "git", "status", "--porcelain").splitlines())
+    print(f"# genome wake — {cfg.root.name} @ {br or '-'} {head or '-'} ({dirty} dirty) "
+          f"[{', '.join(sorted(cfg.modules))}]")
+    cap = cfg.get("core", "wake_lines", 18)
+    if cfg.has("state"):
+        lines = read(cfg.path("state")).splitlines()
+        start = next((i for i, ln in enumerate(lines) if ln.startswith("## ")), 0)
+        end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+        print(f"\n## STATE  {cfg.paths['state']}:{start + 1}-{end}")
+        print("\n".join(lines[start:min(end, start + cap)]))
+        if end - start > cap:
+            print(f"... ({end - start - cap} more lines in the top block)")
+    res = cfg.get("core", "resume")
+    if res:
+        path, _, needle = res.partition("#")
+        got = section_by_heading(cfg.root / path, needle or cfg.get("core", "resume_heading", "Resume here"),
+                                 cfg.get("core", "resume_lines", 30))
+        if got:
+            print(f"\n## RESUME  {path}:{got[0]}")
+            print("\n".join(got[1]))
+        else:
+            print(f"\n## RESUME  (no '{needle}' heading in {path})")
+    elif cfg.has("register"):
+        open_rows = [r for r in rows(cfg.path("register")) if len(r) > 2 and r[1] in ("open", "in-progress", "blocked")]
+        print(f"\n## REGISTER  {len(open_rows)} open")
+        for r in open_rows[:8]:
+            print(f"- [{r[1]}] {r[0]}: {r[2][:90]}")
+    if cfg.has("asks"):
+        pend = [r for r in rows(cfg.path("asks")) if len(r) > 5 and (r[2] == "open" or (r[2] == "ruled" and r[5] in ("", "—")))]
+        if pend:
+            print("\n## OPERATOR")
+            for r in pend:
+                print(f"- {r[0]} [{r[2]}{', unapplied' if r[2] == 'ruled' else ''}] {r[1]}: {r[3][:110]}")
+    if "research" in cfg.modules and cfg.has("hypotheses"):
+        reg = Register(cfg, "hypotheses")
+        live = [r for r in reg.rows if status_word(reg.get(r, "status")) in ("open", "testing")]
+        if live:
+            print(f"\n## HYPOTHESES  {len(live)} open/testing  ({cfg.paths['hypotheses']})")
+            for r in live[:8]:
+                print(f"- {r[0]} [{status_word(reg.get(r, 'status'))}] {reg.get(r, 'text')[:110]}")
+    jobs = cfg.get("ops", "jobs") if "ops" in cfg.modules else None
+    if jobs:
+        try:
+            out = subprocess.run(jobs, shell=True, cwd=cfg.root, capture_output=True, text=True, timeout=30).stdout
+        except subprocess.TimeoutExpired:
+            out = "(jobs command timed out)"
+        print(f"\n## JOBS  `{jobs}`")
+        print("\n".join(out.strip().splitlines()[:12]) or "(none)")
+    if worklog_numbered(cfg):
+        wf = worklog_files(cfg)
+        if wf:
+            print(f"\n## LAST WORKLOG  {cfg.rel(wf[-1])}")
+    elif cfg.has("worklog"):
+        print("\n## LAST WORKLOG")
+        print("\n".join(read(cfg.path("worklog")).splitlines()[-3:]))
+    if "agents" in cfg.modules and cfg.has("feed"):
+        aid = os.environ.get("GENOME_AGENT_ID") or os.environ.get("KB_AGENT_ID")
+        if aid:
+            seen_f = cfg.root / ".genome" / f"seen-{aid}"
+            seen = read(seen_f).strip()
+            lines = read(cfg.path("feed")).splitlines()
+            if seen:
+                idx = next((i for i, l in enumerate(lines) if f"[{seen}]" in l), -1)
+                lines = lines[idx + 1:]
+            mine = [l for l in lines if f"@{aid}" in l]
+            print(f"\n## INBOX  @{aid}: {len(mine)} new")
+            print("\n".join(mine[-8:]))
+            ids = re.findall(r"\*\*\[(F\d{4})\]", read(cfg.path("feed")))
+            if ids:
+                seen_f.parent.mkdir(exist_ok=True)
+                seen_f.write_text(ids[-1])
+    finds, _ = doctor_findings(cfg)
+    lint = run_lint(cfg)
+    errs = sum(1 for f in lint if f.startswith("E"))
+    print(f"\n## HEALTH  doctor {len(finds)} finding(s) · lint {errs} error(s), {len(lint) - errs} warning(s)")
+    for f in finds[:5]:
+        print(f"- {f}")
+    print("\nNext: `genome ask \"<question>\"` → the owning section; read only that range.")
+
+
+# ---------------------------------------------------------------- close
+
+def secret_values(cfg: Cfg) -> list[tuple[str, str]]:
+    out = []
+    for spec in cfg.get("ops", "secrets", []):
+        path, _, key = spec.partition(":")
+        p = Path(os.path.expanduser(path))
+        p = p if p.is_absolute() else cfg.root / p
+        if not p.is_file():
+            continue
+        if key:
+            for ln in read(p).splitlines():
+                m = re.match(rf"\s*(?:export\s+)?{re.escape(key)}\s*=\s*(.*)$", ln)
+                if m:
+                    v = m.group(1).strip()
+                    if v[:1] in "'\"" and v.find(v[0], 1) > 0:  # quoted: up to the closing quote
+                        v = v[1:v.find(v[0], 1)]
+                    else:  # unquoted: an inline ` # comment` is not part of the value
+                        v = re.split(r"\s+#", v, maxsplit=1)[0].strip()
+                    out.append((spec, v))
+        else:
+            text = read(p).strip()
+            out.append((spec, text))
+            out += [(spec, ln.strip()) for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    seen, uniq = set(), []
+    for s_, v in out:
+        if len(v) >= 6 and v not in seen:
+            seen.add(v)
+            uniq.append((s_, v))
+    return uniq
+
+
+def secret_hits(cfg: Cfg) -> tuple[int, list[str]]:
+    """Staged + unstaged diff, plus every untracked file `close` would name for commit."""
+    vals = secret_values(cfg)
+    if not vals:
+        return 0, []
+    diff = sh(cfg.root, "git", "diff", "--cached", timeout=120) + sh(cfg.root, "git", "diff", timeout=120)
+    for st, p in changed_paths(cfg):
+        f = cfg.root / p
+        if st == "??" and f.is_file() and f.stat().st_size < 20_000_000:
+            diff += read(f)
+    return len(vals), [f"{spec}: {diff.count(v)} hit(s)" for spec, v in vals if v in diff]
+
+
+def cmd_secrets(args) -> None:
+    cfg = find_cfg()
+    cfg.need("ops")
+    n, hits = secret_hits(cfg)
+    if not n:
+        print("secrets: no ops.secrets sources configured or readable")
+        return
+    for h in hits:
+        print(f"SECRET IN DIFF — {h}")
+    print(f"secrets: {n} source(s), {'HITS — do not commit' if hits else '0 hits'}")
+    raise SystemExit(ERR if hits else 0)
+
+
+def emit_all(cfg: Cfg) -> list[str]:
+    changed = emit_records(cfg) if "records" in cfg.modules else []
+    if worklog_numbered(cfg) and emit_worklog_index(cfg):
+        changed.append(cfg.rel(worklog_index(cfg)))
+    return changed
+
+
+def cmd_emit(args) -> None:
+    ch = emit_all(find_cfg())
+    print(f"emitted: {', '.join(ch)}" if ch else "zones already current")
+
+
+def cmd_close(args) -> None:
+    """Mechanical iteration close: emit, lint, secrets, gate; print the judgement left."""
+    cfg = find_cfg()
+    red = False
+    changed = emit_all(cfg)
+    for cmd in cfg.get("core", "emitters", []):
+        r = subprocess.run(cmd, shell=True, cwd=cfg.root, capture_output=True, text=True)
+        print(f"emit   {cmd}: {'ok' if r.returncode == 0 else 'FAILED'}")
+        red |= r.returncode != 0
+    if changed:
+        print(f"emit   genome zones refreshed: {', '.join(changed)}")
+    lint = run_lint(cfg)
+    errs = [f for f in lint if f.startswith("E")]
+    print(f"lint   {len(errs)} error(s), {len(lint) - len(errs)} warning(s)")
+    for f in errs[:20]:
+        print(f"       {f}")
+    red |= bool(errs)
+    if "ops" in cfg.modules:
+        n, hits = secret_hits(cfg)
+        print(f"secret {n} source(s), {len(hits)} hit(s)" + (" — " + "; ".join(hits) if hits else ""))
+        red |= bool(hits)
+    gate = cfg.get("core", "gate")
+    if gate and not args.no_gate:
+        r = subprocess.run(gate, shell=True, cwd=cfg.root, capture_output=True, text=True)
+        tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
+        print(f"gate   `{gate}`: {'ok' if r.returncode == 0 else 'FAILED'}" + ("".join(f"\n       {t}" for t in tail)))
+        red |= r.returncode != 0
+    paths = [p for _, p in changed_paths(cfg)]
+    never = cfg.get("core", "never_commit", [])
+    never = list(never) + ["*.genome-lock", ".genome/**", "*.genome-tmp"]
+    staged_gone = {p for st, p in changed_paths(cfg) if st == "D "}  # `git add` on it fails the whole line
+    named = [p for p in paths if not any(gmatch(p, g) for g in never) and not p.startswith(".genome/")
+             and p not in staged_gone]
+    print("\njudgement ([x] checked here, [?] yours to confirm):")
+    checks = []
+    if cfg.has("state"):
+        checks.append(("state updated", cfg.paths["state"] in paths))
+    wl = cfg.paths["worklog"].rstrip("/")
+    wl_index = cfg.rel(worklog_index(cfg)) if worklog_numbered(cfg) else None  # a re-emitted index is not an entry
+    status = dict((p, st) for st, p in changed_paths(cfg))
+    entries = [p for p in paths if p.startswith(wl) and p != wl_index and not status.get(p, " ").startswith("R")]
+    checks.append(("worklog entry written", bool(entries)))  # a renamed old entry is not this session's entry
+    rec_dirs = [cfg.paths[r].rstrip("/") for r in ("decisions", "regressions")] if "records" in cfg.modules else []
+    touched = [p for p in paths if any(p.startswith(d) for d in rec_dirs)]
+    if touched:
+        ids = [r["id"] for p in touched if (cfg.root / p).is_file() and (r := parse_record(cfg, cfg.root / p))]
+        text = "\n".join(read(cfg.root / e) for e in entries)
+        missing = [i for i in ids if not re.search(rf"\b{re.escape(i)}\b", text)]
+        checks.append((f"records changed ({len(touched)}) are cited in the worklog"
+                       + (f" — not cited: {', '.join(missing)}" if missing else ""), bool(entries) and not missing))
+    for item in cfg.get("core", "checklist", []):
+        checks.append((item, None))
+    for text, ok in checks:
+        print(f"  [{'x' if ok else ' ' if ok is False else '?'}] {text}")
+    if named:
+        print("\ncommit named paths:\n  git add -- " + " ".join(shlex.quote(p) for p in named))
+    skipped = len(paths) - len(named)
+    if skipped:
+        print(f"  ({skipped} path(s) left out by core.never_commit)")
+    print(f"\nclose: {'RED — fix before commit' if red else 'green'}")
+    raise SystemExit(ERR if red else 0)
+
+
+# ---------------------------------------------------------------- init
+
+def scaffold_roles(cfg: Cfg) -> list[str]:
+    """Create each enabled role that is missing, at its mapped path. Never touches an existing file,
+    a native:/overlay: role, or a role the repo's own tooling generates."""
+    tpl = {"register": REGISTER_TPL, "entry": ENTRY_TPL, "state": STATE_TPL, "runbook": RUNBOOK_TPL,
+           "ledger": CLOSED_TPL, "asks": ASKS_TPL, "records_index": RECORDS_TPL, "hypotheses": HYP_TPL,
+           "quarantine": QUAR_TPL, "prereg": PREREG_TPL, "ownership_map": MAP_TPL, "feed": FEED_TPL}
+    dirs = ("plans", "audits", "decisions", "regressions", "workflows", "archive")
+    made = []
+    for m in sorted(cfg.modules):
+        for role in MODULE_ROLES[m]:
+            if cfg.form(role)[0] != "file" or cfg.path(role).exists():
+                continue
+            p = cfg.path(role)
+            if role == "worklog":
+                if worklog_numbered(cfg):
+                    p.mkdir(parents=True)
+                else:
+                    atomic_write(p, WORKLOG_TPL)
+            elif role == "evidence":
+                atomic_write(p / "README.md", EVIDENCE_TPL)
+            elif role in dirs:
+                p.mkdir(parents=True)
+                if role == "archive" and cfg.get("core", "archive_form", "flat") == "flat":
+                    atomic_write(p / "INDEX.md", "| date | original | reason |\n|---|---|---|\n")
+            elif role in tpl:
+                atomic_write(p, tpl[role])
+            else:
+                continue
+            made.append(cfg.paths[role])
+    return made
+
+
+def ignore_runtime(root: Path) -> list[str]:
+    """Locks, temp files, recon tokens and read marks are machine state: never committed."""
+    gi = root / ".gitignore"
+    have = read(gi).splitlines()
+    want = [g for g in ("*.genome-lock", "*.genome-tmp", ".genome/") if g not in have]
+    if not want:
+        return []
+    with open(gi, "a") as f:
+        f.write("\n# genome runtime state (locks, temp files, recon tokens, read marks)\n" + "\n".join(want) + "\n")
+    return [f".gitignore (+{', '.join(want)})"]
+
+
+def cmd_init(args) -> None:
+    root = Path.cwd().resolve()
+    if (root / "genome.toml").exists() and not args.force:  # adoption: the map is hand-written, fill its gaps
+        cfg = find_cfg(root)
+        if cfg.root != root:
+            die(f"run init at the project root ({cfg.root})")
+        made = scaffold_roles(cfg) + ignore_runtime(root)
+        print(f"genome init: genome.toml kept; {len(made)} change(s): missing roles at their mapped paths, runtime ignores")
+        for m in made:
+            print(f"  + {m}")
+        print("next: `genome lint --advisory`, then triage (references/adoption.md)")
+        return
+    mods = PROFILES[args.profile] if args.profile else ["core", *[m for m in (args.modules or "").split(",") if m]]
+    mods = [m for m in MODULES if m in set(mods) | {"core"}]
+    made, kept = [], []
+
+    def write(rel: str, body: str) -> None:
+        p = root / rel
+        if p.exists():
+            kept.append(rel)
+            return
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body)
+        made.append(rel)
+
+    gate = next((g for f, g in (("Cargo.toml", "cargo test --locked"), ("pyproject.toml", "pytest -q"),
+                                ("package.json", "npm test"), ("go.mod", "go test ./...")) if (root / f).is_file()), "")
+    write("genome.toml", genome_toml(mods, gate))
+    write("AGENTS.md", agents_tpl(mods, gate))
+    files = {
+        "core": [("TODO.md", REGISTER_TPL), ("docs/handoff/README.md", ENTRY_TPL),
+                 ("docs/handoff/STATE.md", STATE_TPL), ("docs/RUNBOOK.md", RUNBOOK_TPL),
+                 ("docs/kb/CLOSED.md", CLOSED_TPL), ("docs/kb/WORKLOG.md", WORKLOG_TPL),
+                 ("docs/kb/ASKS.md", ASKS_TPL), ("docs/archive/INDEX.md", "| date | original | reason |\n|---|---|---|\n")],
+        "records": [("docs/RECORDS.md", RECORDS_TPL)],
+        "research": [("docs/kb/HYPOTHESES.md", HYP_TPL), ("docs/kb/QUARANTINE.md", QUAR_TPL),
+                     ("docs/kb/PREREG.md", PREREG_TPL), ("evidence/README.md", EVIDENCE_TPL)],
+        "ops": [("docs/INDEX.md", MAP_TPL)],
+        "agents": [("docs/kb/feed.md", FEED_TPL)],
+    }
+    dirs = {"core": ["docs/plans", "docs/audit"], "records": ["docs/decisions", "docs/regressions"],
+            "agents": ["docs/kb/workflows"]}
+    for m in mods:
+        for rel, body in files.get(m, []):
+            write(rel, body)
+        for d in dirs.get(m, []):
+            (root / d).mkdir(parents=True, exist_ok=True)
+    made += ignore_runtime(root)
+    if "records" in mods:
+        cfg = find_cfg(root)
+        emit_records(cfg)
+    print(f"genome init [{', '.join(mods)}]: created {len(made)}, kept {len(kept)} existing")
+    for m in made:
+        print(f"  + {m}")
+    for k in kept:
+        print(f"  = {k} (kept)")
+    print("next: fill AGENTS.md (what this is, the routing table), then `genome lint`")
+
+
+def cmd_modules(args) -> None:
+    cfg = find_cfg()
+    src = "kb.toml (legacy; `genome` reads it unchanged)" if cfg.legacy else "genome.toml"
+    print(f"config: {src}")
+    for m in MODULES:
+        on = m in cfg.modules
+        print(f"  [{'x' if on else ' '}] {m:9} {MODULE_HELP[m]}")
+
+
+MODULE_HELP = {
+    "core": "roles, lint, doctor, wake, ask, close, archive, plan/audit, log, status, q (operator asks)",
+    "records": "rec recon|new|amend|supersede|merge|retire|list|show|emit (AD/RG lifecycle, ID map)",
+    "research": "figure, quarantine, hyp add|verdict|list, prereg freeze|check (evidence discipline)",
+    "ops": "secrets + lint gates: ownership map, links, unreachable code, tracked bulk, running-job guard",
+    "agents": "wf new|add|list, claim, done, claim-register, post, feed (parallel agents)",
+}
+
+
+# ---------------------------------------------------------------- core commands
+
+def cmd_status(args) -> None:
+    cfg = find_cfg()
+    reg = cfg.require("register", "genome status")
+    if args.status not in STATUS_VOCAB:
+        die(f"status must be one of {STATUS_VOCAB}")
+    if args.status in TERMINAL and not args.evidence:
+        die(f"`{args.id} -> {args.status}` is terminal: --evidence <existing path>")
+    if args.evidence and not (cfg.root / args.evidence).exists():
+        die(f"evidence path does not exist: {args.evidence}")
+    with Guarded(reg):
+        row = find_row(reg, args.id) or die(f"no register row `{args.id}`")
+        row = list(row) + [""] * (4 - len(row))
+        held = re.search(r"claimed-by `?([A-Za-z0-9_.-]+)", row[3])
+        if held and args.agent and held.group(1) != args.agent:
+            die(f"`{args.id}` is claimed by {held.group(1)}", ERR)
+        row[1] = args.status
+        if args.status in TERMINAL:
+            row[2] = f"{row[2]} → [{today()}] `{args.evidence}`" + (f" — verdict: {args.note}" if args.note else "")
+        replace_row(reg, args.id, row)
+    print(f"register: {args.id} → {args.status}")
+
+
+def cmd_plan(args, role: str = "plans") -> None:
+    cfg = find_cfg()
+    d = cfg.require(role, f"genome {role[:-1]}")
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{today()}-{slugify(args.title)}.md"
+    if p.exists():
+        die(f"{cfg.rel(p)} exists — pick another title")
+    p.write_text((PLAN_TPL if role == "plans" else AUDIT_TPL).replace("{{TITLE}}", args.title).replace("{{DATE}}", today()))
+    print(cfg.rel(p))
+
+
+def readers(cfg: Cfg, needle: str) -> list[str]:
+    out = sh(cfg.root, "git", "grep", "-l", "-w", "-F", "-e", needle, "--").splitlines()
+    gen = {t for t in record_zone_targets(cfg)} | {cfg.paths["records_index"]}
+    return [f for f in out if not is_archived(cfg, f) and f not in gen]
+
+
+def cmd_archive(args) -> None:
+    cfg = find_cfg()
+    arch = cfg.require("archive", "genome archive")
+    src = Path(args.path).resolve()
+    if not (src.is_file() or (src.is_dir() and not args.section)) or cfg.root.resolve() not in src.parents:
+        die(f"{args.path} is not a file (or, without --section, a directory) inside this project")
+    rel = cfg.rel(src)
+    gens = cfg.get("core", "archive_form", "flat") == "generations"
+    gen = slugify(args.generation, 60) if args.generation else (f"{today()}-{slugify(args.reason, 30)}" if gens else "")
+    if args.section:
+        text = read(src)
+        lines = text.splitlines()
+        hs = headings(lines)
+        want = args.section.lower().strip()
+        exact = [(k, lv) for k, lv in hs if lines[k].lstrip("# ").strip().lower() == want]
+        some = exact or [(k, lv) for k, lv in hs if want in lines[k].lower()]
+        if not some:
+            die(f"no heading containing '{args.section}' in {rel}")
+        if len(some) > 1:  # moving the wrong section out of a living plan is silent damage
+            die(f"'{args.section}' matches {len(some)} headings in {rel}: "
+                + "; ".join(f"{k + 1}: {lines[k][:60]}" for k, _ in some[:5]) + " — give the exact heading text")
+        i, lvl = some[0]
+        j = next((k for k, lv in hs if k > i and lv <= lvl), len(lines))
+        res_path, _, res_head = (cfg.get("core", "resume") or "").partition("#")
+        res_head = res_head or cfg.get("core", "resume_heading", "Resume here")
+        if res_path == rel and any(res_head.lower() in ln.lower() for ln in lines[i:j]):
+            die(f"§ {lines[i].lstrip('# ')[:60]} holds the '{res_head}' block `genome wake` resumes from "
+                "(sub-sections move with their parent) — move that block out first")
+        name = f"{Path(rel).stem}--{slugify(lines[i], 40)}.md"
+        dst = (arch / gen / Path(rel).parent / name) if gens else arch / name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            die(f"{cfg.rel(dst)} exists")
+        dst.write_text(f"<!-- archived {today()} from {rel} (lines {i + 1}-{j}): {args.reason} -->\n\n"
+                       + "\n".join(lines[i:j]) + "\n")
+        stub = f"> Archived {today()}: § {lines[i].lstrip('# ')[:80]} → `{cfg.rel(dst)}` ({args.reason})."
+        atomic_write(src, "\n".join(lines[:i] + [stub, ""] + lines[j:]) + "\n")
+        moved = f"{rel} § {lines[i].lstrip('# ')[:60]}"
+    else:
+        dst = (arch / gen / rel) if gens else arch / src.name
+        if dst.exists():
+            die(f"archive already holds {cfg.rel(dst)}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+        moved = rel
+        if not gens and dst.is_file():  # flat archive: tombstone keeps the old path findable
+            src.write_text(f"# {src.stem} (superseded)\n\n<!-- kb: tombstone target=\"{cfg.rel(dst)}\" -->\n\n"
+                           f"Moved to `{cfg.rel(dst)}` on {today()}.\n\n**Reason:** {args.reason}\n")
+    if gens:
+        append_row(arch / gen / "README.md", [f"`{cfg.rel(dst)[len(cfg.rel(arch / gen)) + 1:]}{'/' if dst.is_dir() else ''}`",
+                                              args.by or "—",
+                                              args.reason, today()],
+                   f"# Archive generation {gen}\n\n| file | superseded by | reason | date |\n|---|---|---|---|\n")
+    else:
+        append_row(arch / "INDEX.md", [today(), moved, args.reason], "| date | original | reason |\n|---|---|---|\n")
+    print(f"archived {moved} → {cfg.rel(dst)}" + (f" (no --generation given: `{gen}`)" if gens and not args.generation else ""))
+    if not args.section:
+        for r in readers(cfg, rel):
+            print(f"relink: {r} still cites `{rel}`")
+
+
+def cmd_log(args) -> None:
+    cfg = find_cfg()
+    wl = cfg.require("worklog", "genome log")
+    sig = f" · `{args.agent}`" if args.agent else ""
+    if args.body_file:  # a session entry is a page of markdown, not an argv string
+        args.body = sys.stdin.read() if args.body_file == "-" else (read(Path(args.body_file)) or die(f"empty or missing {args.body_file}"))
+    if worklog_numbered(cfg):
+        if not args.entry:
+            die("numbered worklog: `genome log \"<title>\"` creates the next file")
+        with Guarded(wl / ".genome-log"):  # two sessions logging at once must not share a number
+            nums = [int(re.match(r"\d+", f.name).group(0)) for f in worklog_files(cfg)]
+            width = cfg.get("core", "worklog_width", 4)
+            n = f"{max(nums, default=0) + 1:0{width}d}"
+            p = wl / f"{n}-{today()}-{slugify(args.entry, 50)}.md"
+            with open(p, "x") as f:
+                f.write(f"# {n} — {today()} — {args.entry}{sig}\n\n" + (args.body + "\n" if args.body else ""))
+            emit_worklog_index(cfg)
+        print(cfg.rel(p))
+        return
+    with Guarded(wl):
+        wl.parent.mkdir(parents=True, exist_ok=True)
+        with open(wl, "a") as f:
+            f.write(f"- **{now()}**{sig} — {args.entry}\n")
+    print(f"worklog: appended ({cfg.rel(wl)})")
+
+
+def cmd_handoff(args) -> None:
+    cfg = find_cfg()
+    head = sh(cfg.root, "git", "rev-parse", "HEAD").strip() or "(not a git repo)"
+    br = sh(cfg.root, "git", "rev-parse", "--abbrev-ref", "HEAD").strip()
+    dirty = sh(cfg.root, "git", "status", "--short").strip()
+    open_rows = [f"  - [{r[1]}] {r[0]}: {r[2][:80]}" for r in rows(cfg.path("register"))
+                 if cfg.has("register") and len(r) > 2 and r[1] in ("open", "in-progress", "blocked")]
+    tail = read(cfg.path("worklog")).splitlines()[-5:] if cfg.has("worklog") and cfg.path("worklog").is_file() else []
+    out = [f"# State — {today()}", "", f"Repo branch `{br}`, HEAD `{head}`."
+           + (f" Working tree dirty ({len(dirty.splitlines())} paths)." if dirty else " Tree clean."),
+           "", "## Open register rows", *(open_rows or ["  (none)"]), "", "## Recent worklog",
+           *(tail or ["  (see the worklog directory)"]), "", "Regenerate with `genome handoff --write`."]
+    if args.write:
+        atomic_write(cfg.require("state", "genome handoff --write"), "\n".join(out) + "\n")
+        print(f"wrote {cfg.paths['state']}")
+    else:
+        print("\n".join(out))
+
+
+def cmd_q(args) -> None:
+    """Operator questions and rulings: asked → ruled → applied to the owner."""
+    cfg = find_cfg()
+    p = cfg.require("asks", "genome q")
+    if args.q_cmd == "add":
+        text = " ".join([args.id or ""] + args.text).strip() or die("q add needs the question text")
+        with Guarded(p):
+            qid = next_id(p, "Q")
+            append_row(p, [qid, today(), "open", text, "—", "—"], ASKS_TPL)
+        print(f"{qid} open — ask the operator; `genome q rule {qid} \"<ruling>\" --applied <path>` records the answer")
+    elif args.q_cmd in ("rule", "apply", "withdraw"):
+        with Guarded(p):
+            r = list(find_row(p, args.id) or die(f"no ask `{args.id}`"))
+            r += ["—"] * (6 - len(r))
+            if args.q_cmd == "rule":
+                r[2], r[4] = "ruled", " ".join(args.text)
+            if args.q_cmd == "withdraw":
+                r[2] = "withdrawn"
+            for a in args.applied or []:
+                if not (cfg.root / a).exists():
+                    die(f"applied-to path does not exist: {a}")
+                r[5] = (r[5].strip("— ") + f" `{a}`").strip()
+            replace_row(p, args.id, r)
+        print(f"{args.id}: {r[2]}" + ("" if r[5] not in ("", "—") else " — not yet applied to an owner (genome q apply)"))
+    else:
+        for r in rows(p):
+            if not args.open or r[2] == "open" or (r[2] == "ruled" and r[5] in ("", "—")):
+                print(" | ".join(r))
+
+
+# ---------------------------------------------------------------- records commands
+
+def recon_file(cfg: Cfg) -> Path:
+    return cfg.root / ".genome" / "recon.json"
+
+
+def cmd_rec(args) -> None:
+    cfg = find_cfg()
+    cfg.need("records")
+    a = args.rec_cmd
+    if a == "recon":
+        kw = " ".join(args.keywords)
+        q = toks(kw)
+        hits = []
+        for r in records(cfg) + records(cfg, True):
+            s = len(q & toks(r["title"] + " " + r["desc"])) * 3 + len(q & toks(r["text"][:4000]))
+            if s:
+                hits.append((s, r))
+        hits.sort(key=lambda x: -x[0])
+        print(f"records matching '{kw}':")
+        for s, r in hits[:10]:
+            where = "archived" if is_archived(cfg, cfg.rel(r["path"])) else r["status"]
+            print(f"  {r['id']:16} {where:10} {r['title'][:90]}")
+        print("owner sections matching:")
+        for s, f, h, lo, hi, _ in ask_rank(cfg, kw, 6):
+            print(f"  {cfg.rel(f)}:{lo}-{hi} § {h[:70]}")
+        token = "R" + dt.datetime.now().strftime("%m%d%H%M%S")
+        recon_file(cfg).parent.mkdir(exist_ok=True)
+        recon_file(cfg).write_text(json.dumps({"token": token, "ts": dt.datetime.now().timestamp(), "kw": kw}))
+        print(f"\nrecon token {token} — amend an owner above if it covers the topic; otherwise "
+              f"`genome rec new ad|rg \"<title>\" --recon {token} --orthogonal \"<why no owner covers it>\"`")
+        return
+    if a == "new":
+        try:
+            rc = json.loads(read(recon_file(cfg)) or "{}")
+        except json.JSONDecodeError:
+            rc = {}
+        hours = cfg.get("records", "recon_hours", 6)
+        if rc.get("token") != args.recon or dt.datetime.now().timestamp() - rc.get("ts", 0) > hours * 3600:
+            die(f"--recon must be the token of a `genome rec recon` run in the last {hours} h (prior art first)")
+        kind = args.kind.upper()
+        d = cfg.require("decisions" if kind == "AD" else "regressions", "genome rec new")
+        d.mkdir(parents=True, exist_ok=True)
+        lock = Guarded(d / ".genome-rec")  # released at exit: two agents never mint one ID
+        lock.__enter__()
+        known = records(cfg) + records(cfg, True)
+        nums = [r["num"] for r in known if r["kind"] == kind]
+        # an ID anyone ever cited is spent, even when its file is gone (a retired record not yet imported)
+        cited = re.compile(rf"\b{re.escape(rec_prefix(cfg))}{kind}-(\d+)\b")
+        nums += [int(x) for r in known for x in cited.findall(r["text"])]
+        if cfg.has("records_index"):
+            nums += [int(x) for x in cited.findall(read(cfg.path("records_index")))]
+        width = cfg.get("records", "width", 3)
+        rid = f"{rec_prefix(cfg)}{kind}-{max(nums, default=0) + 1:0{width}d}"
+        p = d / f"{rid}-{slugify(args.title)}.md"
+        fm = {"ID": rid, "Title": args.title, "Status": "Active", "Date": today(),
+              "Description": args.description or args.title}
+        if kind == "RG":
+            fm["Severity"] = args.severity
+        body = (AD_BODY if kind == "AD" else RG_BODY).replace("{{ID}}", rid).replace("{{TITLE}}", args.title)
+        mode = cfg.get("records", "mode", "immutable")
+        body = body.replace("{{MODE}}", "Amended only by dated `## Amendment` sections (`genome rec amend`)."
+                            if mode == "amendable" else "Immutable once numbered: a correction is a new record that supersedes this one.")
+        body += f"\n## Orthogonality\n\n{args.orthogonal} (recon {args.recon}: {rc.get('kw', '')})\n\n## Revisions\n\n- {today()}: created\n"
+        with open(p, "x") as f:
+            f.write("---\n" + "\n".join(f'{k}: "{yq(v)}"' for k, v in fm.items()) + "\n---\n\n" + body)
+        emit_records(cfg)
+        print(cfg.rel(p))
+        return
+    if a == "amend":
+        if cfg.get("records", "mode", "immutable") != "amendable":
+            die("records.mode is immutable — correct a record with `genome rec supersede`, or set mode = \"amendable\"")
+        r = find_record(cfg, args.id)
+        body = (sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text()) if args.body_file else (args.body or "")
+        if not body.strip():
+            die("an amendment needs its text: --body \"...\" or --body-file <path>")
+        text = r["text"]
+        bad = [kv for kv in args.set or [] if not re.fullmatch(r"[A-Za-z][\w-]*=.*", kv)]
+        if bad:
+            die(f"--set takes Field=value, got {bad}")
+        fields = dict(kv.split("=", 1) for kv in args.set or [])
+        if {"ID", "Status"} & set(fields):
+            die("--set cannot change ID or Status — use `genome rec supersede/merge/retire`")
+        if fields:
+            text = set_front(text, fields)
+        # amendments are chronological at the end; the revision line goes into ## Revisions
+        text = text.rstrip("\n") + f"\n\n## Amendment {today()} — {args.title}\n\n{body.strip()}\n"
+        rev = f"- {today()}: {args.reason}" + (f" [Updated: {', '.join(f'{k}={v}' for k, v in fields.items())}]" if fields else "")
+        atomic_write(r["path"], add_revision(text, rev))
+        emit_records(cfg)
+        print(f"{r['id']}: amended ({args.title})")
+        return
+    if a in ("supersede", "merge", "retire"):
+        ids = args.ids
+        target = None if a == "retire" else find_record(cfg, args.by)
+        plan = [find_record(cfg, rid) for rid in ids]  # all exist, or nothing moves
+        for r in plan:
+            if target and r["id"] == target["id"]:
+                die(f"{r['id']} cannot be merged into itself — nothing was changed")
+            if (rec_archive(cfg) / r["path"].name).exists():
+                die(f"the records archive already holds {r['path'].name} — nothing was changed")
+        for r in plan:
+            st = "Retired" if a == "retire" else "Superseded"
+            fields = {"Status": st}
+            if target:
+                fields["SupersededBy"] = target["id"]
+            text = add_revision(set_front(r["text"], fields), f"- {today()}: {st.lower()}"
+                                + (f" by {target['id']}" if target else "") + f" — {args.reason}")
+            dst = rec_archive(cfg) / r["path"].name
+            atomic_write(dst, text)
+            r["path"].unlink()
+            if target:
+                atomic_write(target["path"], add_revision(read(target["path"]),
+                                                          f"- {today()}: absorbed {r['id']} — {args.reason}"))
+            print(f"{r['id']} → {st}{' by ' + target['id'] if target else ''}; moved to {cfg.rel(dst)}")
+            cites = [f for f in readers(cfg, r["id"]) if f != cfg.rel(dst)]
+            if cites:
+                print(f"  {len(cites)} live file(s) cite {r['id']} — they resolve through the ID map; relink when you touch them")
+        emit_records(cfg)
+        return
+    if a == "list":
+        for r in records(cfg) + (records(cfg, True) if args.all else []):
+            print(f"{r['id']:16} {r['status']:10} {r['title'][:100]}")
+        return
+    if a == "show":
+        r = find_record(cfg, args.id, archived_ok=True)
+        if r["status"] in ("Superseded", "Retired"):
+            print(f"{r['id']} is {r['status']}" + (f" → read {r['by']}" if r["by"] else ""))
+        print(cfg.rel(r["path"]))
+        print("\n".join(r["text"].splitlines()[:args.lines]))
+        return
+    if a == "emit":
+        ch = emit_records(cfg)
+        print(f"emitted: {', '.join(ch) if ch else 'unchanged'}")
+
+
+# ---------------------------------------------------------------- research commands
+
+def figure_hits(cfg: Cfg, value: str) -> list[str]:
+    out = sh(cfg.root, "git", "grep", "-n", "-F", "-e", value, "--").splitlines()
+    if not out and not sh(cfg.root, "git", "rev-parse", "HEAD").strip():
+        out = [f"{cfg.rel(p)}:{n}:{ln}" for p in cfg.root.rglob("*.md")
+               for n, ln in enumerate(read(p).splitlines(), 1) if value in ln]
+    ev = cfg.paths["evidence"].rstrip("/") + "/"
+    return [h for h in out if not is_archived(cfg, h.split(":", 1)[0]) and not h.startswith(ev)]
+
+
+def cmd_figure(args) -> None:
+    cfg = find_cfg()
+    cfg.need("research")
+    hits = figure_hits(cfg, args.value)
+    for h in hits:
+        print(h[:200])
+    print(f"figure `{args.value}`: {len(hits)} live occurrence(s) (archive and evidence store excluded)")
+
+
+def cmd_quarantine(args) -> None:
+    cfg = find_cfg()
+    cfg.need("research")
+    p = cfg.require("quarantine", "genome quarantine")
+    with Guarded(p):
+        append_row(p, [" ".join(f"`{f}`" for f in args.figures), args.where or "—", args.why, args.by or "—", today()],
+                   QUAR_TPL)
+    hist = [cfg.paths[r].rstrip("/") + ("/" if cfg.path(r).is_dir() else "") for r in APPEND_ONLY
+            if cfg.form(r)[0] == "file"]
+    live, past = {}, set()
+    for f in args.figures:
+        for h in figure_hits(cfg, f):
+            loc = h.split(":", 2)
+            if loc[0] == cfg.paths["quarantine"]:
+                continue
+            if any(loc[0] == x or (x.endswith("/") and loc[0].startswith(x)) for x in hist):
+                past.add(loc[0])  # append-only history keeps what it said; the quarantine row is the correction
+            else:
+                live.setdefault(":".join(loc[:2]), h)
+    print(f"quarantined {len(args.figures)} figure(s); strike {len(live)} live occurrence(s) now:")
+    for h in live.values():
+        print(f"  {h[:180]}")
+    if past:
+        print(f"  ({len(past)} append-only history file(s) also quote them; leave those as written)")
+
+
+def cmd_hyp(args) -> None:
+    cfg = find_cfg()
+    cfg.need("research")
+    p = cfg.require("hypotheses", "genome hyp")
+    prefix = cfg.get("research", "hyp_prefix", "H")
+    if not p.exists():
+        atomic_write(p, HYP_TPL)
+    if args.hyp_cmd == "add":
+        text = " ".join([args.id or ""] + args.text).strip() or die("hyp add needs the hypothesis text")
+        with Guarded(p):
+            reg = Register(cfg, "hypotheses")
+            hid, row = reg.next_id(prefix), ["—"] * len(reg.header)
+            row[0] = hid
+            for name, val in (("status", "open"), ("text", text)):
+                k = reg.col(name)
+                if k is None:
+                    die(f"the hypotheses register has no `{name}` column ({' | '.join(reg.header)})")
+                row[k] = val
+            reg.write(None, row)
+        print(f"{hid} open")
+    elif args.hyp_cmd == "verdict":
+        vocab = hyp_vocab(cfg)
+        if args.status is None and args.text and args.text[0] in vocab:  # `hyp verdict H3 rejected …`
+            args.status = args.text[0]
+        if args.status not in vocab:
+            die(f"status must be one of {vocab}")
+        if args.status in HYP_TERMINAL and not (args.evidence and (cfg.root / args.evidence).exists()):
+            die(f"{args.status} needs --evidence <existing path>: a verdict without its measurement is unfalsifiable")
+        if args.status == "rejected" and not args.reopen and Register(cfg, "hypotheses").col("reopen") is not None:
+            die("rejected needs --reopen \"<the new evidence that would re-open it>\"")
+        with Guarded(p):
+            reg = Register(cfg, "hypotheses")
+            i, r = reg.find(args.id) or die(f"no hypothesis `{args.id}`")
+            r += ["—"] * (len(reg.header) - len(r))
+            r[reg.col("status")] = args.status
+            k = reg.col("evidence")
+            if args.evidence and k is not None:  # appended: an earlier verdict's evidence stays readable
+                stamp = f"[{today()}] `{args.evidence}`" + (f" — {args.note}" if args.note else "")
+                r[k] = stamp if r[k] in ("", "—") else f"{r[k]} · {stamp}"
+            k = reg.col("reopen")
+            if args.reopen:
+                if k is None:
+                    die("the hypotheses register has no re-open column; put the condition in --note")
+                r[k] = args.reopen
+            reg.write(i, r)
+        print(f"{args.id} → {args.status}")
+    else:
+        reg = Register(cfg, "hypotheses")
+        for r in reg.rows:
+            if not args.open or status_word(reg.get(r, "status")) in ("open", "testing"):
+                print(" | ".join(r))
+
+
+RESULTS_RE = re.compile(rb"^#{1,6}[ \t]*(results|verdict)\b", re.I | re.M)
+
+
+def spec_hashes(data: bytes) -> tuple[str, str]:
+    """(spec part, whole file). The spec part ends at the first `## Results` / `## Verdict` heading, so the run's
+    results can be appended to the frozen spec; the whole-file hash keeps earlier freezes valid."""
+    m = RESULTS_RE.search(data)
+    part = (data[:m.start()] if m else data).rstrip()  # the blank line before an appended heading is not the spec
+    return hashlib.sha256(part).hexdigest()[:16], hashlib.sha256(data).hexdigest()[:16]
+
+
+def cmd_prereg(args) -> None:
+    cfg = find_cfg()
+    cfg.need("research")
+    p = cfg.require("prereg", "genome prereg")
+    if args.pr_cmd == "freeze":
+        spec = cfg.root / args.spec
+        if not spec.is_file():
+            die(f"no spec file {args.spec}")
+        prior = [r for r in rows(p) if len(r) > 1 and r[1].strip("`") == cfg.rel(spec)]
+        if prior and not args.reason:
+            die("this spec is already frozen; re-freezing a pre-registration needs --reason (it is visible forever)")
+        if args.at:  # backfill: freeze the spec as it was committed, then lint proves it has not moved since
+            data = subprocess.run(["git", "show", f"{args.at}:{cfg.rel(spec)}"], cwd=cfg.root,
+                                  capture_output=True).stdout or die(f"{cfg.rel(spec)} is not in commit {args.at}")
+            head = sh(cfg.root, "git", "rev-parse", "--short", args.at).strip()
+        else:
+            data, head = spec.read_bytes(), sh(cfg.root, "git", "rev-parse", "--short", "HEAD").strip() or "—"
+        sha = spec_hashes(data)[0]
+        if sha != spec_hashes(spec.read_bytes())[0]:
+            die(f"the spec part of {cfg.rel(spec)} changed after {args.at}: freeze it at the commit that holds its "
+                "current text, or record the change with --reason")
+        with Guarded(p):
+            append_row(p, [today(), f"`{cfg.rel(spec)}`", f"`{sha}`", head, args.reason or args.note or "—"], PREREG_TPL)
+        print(f"frozen {cfg.rel(spec)} sha {sha} at {head} — run the confirmatory test only after this commit")
+    else:
+        bad = [e for e in lint_research(cfg) if e.startswith("E203")]
+        print("\n".join(bad) or "prereg: every frozen spec is unchanged")
+        raise SystemExit(ERR if bad else 0)
+
+
+# ---------------------------------------------------------------- agents commands
+
+def agent_id(args) -> str:
+    return getattr(args, "agent", None) or os.environ.get("GENOME_AGENT_ID") or os.environ.get("KB_AGENT_ID") \
+        or f"agent-{os.uname().nodename}"
+
+
+def _post(cfg: Cfg, aid: str, msg: str, wf=None, to=None, reply=None) -> str | None:
+    if cfg.form("feed")[0] != "file" or "agents" not in cfg.modules:
+        return None
+    feed = cfg.path("feed")
+    feed.parent.mkdir(parents=True, exist_ok=True)
+    with Guarded(feed):
+        ids = [int(x) for x in re.findall(r"\*\*\[F(\d{4})\]", read(feed))]
+        fid = f"F{max(ids, default=0) + 1:04d}"
+        head = f"- **[{fid}]** {now()} · `{aid}`" + (f" · wf:{wf}" if wf else "") + (f" · @{to}" if to else "") \
+            + (f" · → {reply}" if reply else "")
+        with open(feed, "a") as f:
+            f.write(f"{head} — {msg}\n")
+    return fid
+
+
+def _wf_path(cfg: Cfg, wf: str) -> Path:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", wf or ""):
+        die(f"workflow name `{wf}` must be kebab-case")
+    return cfg.require("workflows", "genome wf") / f"{wf}.md"
+
+
+def _board_of(cfg: Cfg, item: str) -> Path:
+    d = cfg.path("workflows")
+    for f in sorted(d.glob("*.md")) if d.is_dir() else []:
+        if find_row(f, item):
+            return f
+    die(f"no workflow board holds `{item}` — `genome wf list`")
+
+
+def cmd_wf(args) -> None:
+    cfg = find_cfg()
+    cfg.need("agents")
+    if args.wf_cmd == "new":
+        p = _wf_path(cfg, args.name)
+        if p.exists():
+            die(f"board exists: {cfg.rel(p)}")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(WF_TPL.replace("{{WF}}", args.name))
+        print(f"workflow: {cfg.rel(p)} created")
+    elif args.wf_cmd == "add":
+        p = _wf_path(cfg, args.name)
+        if not p.exists():
+            die(f"no board `{args.name}` — `genome wf new {args.name}` first")
+        with Guarded(p):
+            n = max([int(m.group(1)) for r in rows(p) if (m := re.fullmatch(re.escape(args.name) + r"-(\d+)", r[0]))],
+                    default=0) + 1
+            append_row(p, [f"{args.name}-{n:03d}", "open", args.item, "—", "—"], "")
+        print(f"{args.name}-{n:03d} added (open)")
+    else:
+        d = cfg.path("workflows")
+        for f in sorted(d.glob("*.md")) if d.is_dir() else []:
+            rs = rows(f)
+            print(f"{f.stem:24} {len(rs):3} rows, {sum(r[1] == 'open' for r in rs if len(r) > 1)} open")
+
+
+def cmd_claim(args) -> None:
+    cfg = find_cfg()
+    cfg.need("agents")
+    p = _board_of(cfg, args.item)
+    aid = agent_id(args)
+    with Guarded(p):
+        r = list(find_row(p, args.item))
+        held = re.search(r"claimed-by `?([A-Za-z0-9_.-]+)", r[3] if len(r) > 3 else "")
+        if held and held.group(1) != aid:
+            die(f"`{args.item}` is claimed by {held.group(1)} — post to the feed or take another item", ERR)
+        r[1], r[3] = "in-progress", f"claimed-by `{aid}` since {now()}"
+        replace_row(p, args.item, r)
+    _post(cfg, aid, f"claiming `{args.item}` on board `{p.stem}`", p.stem)
+    print(f"{args.item}: claimed by {aid}")
+
+
+def cmd_done(args) -> None:
+    cfg = find_cfg()
+    cfg.need("agents")
+    p = _board_of(cfg, args.item)
+    if args.new_status in TERMINAL and not args.evidence:
+        die("terminal: --evidence names where the verdict lives")
+    with Guarded(p):
+        row = find_row(p, args.item)
+        r = list(row) + ["—"] * (5 - len(row))
+        r[1] = args.new_status
+        if args.new_status in TERMINAL:
+            r[4] = f"[{today()}] {args.evidence}" + (f" — {args.note}" if args.note else "")
+        replace_row(p, args.item, r)
+    _post(cfg, agent_id(args), f"`{args.item}` → {args.new_status}", p.stem)
+    print(f"{args.item} → {args.new_status}")
+
+
+def cmd_claim_register(args) -> None:
+    cfg = find_cfg()
+    cfg.need("agents")
+    reg = cfg.require("register", "genome claim-register")
+    aid = agent_id(args)
+    with Guarded(reg):
+        row = find_row(reg, args.id) or die(f"no register row `{args.id}`")
+        r = list(row) + [""] * (4 - len(row))
+        held = re.search(r"claimed-by `?([A-Za-z0-9_.-]+)", r[3])
+        if held and held.group(1) != aid:
+            die(f"`{args.id}` is claimed by {held.group(1)}", ERR)
+        claim = f"claimed-by `{aid}` since {now()}"
+        r[3] = f"{r[3]} · {claim}".strip(" ·") if r[3] and r[3] != "—" else claim
+        replace_row(reg, args.id, r)
+    _post(cfg, aid, f"claiming register row `{args.id}`")
+    print(f"register: {args.id} claimed by {aid}")
+
+
+def cmd_post(args) -> None:
+    cfg = find_cfg()
+    cfg.need("agents")
+    cfg.require("feed", "genome post")
+    fid = _post(cfg, agent_id(args), args.message, args.workflow, args.to.lstrip("@") if args.to else None, args.reply)
+    print(f"feed: [{fid}] by {agent_id(args)}")
+
+
+def cmd_feed(args) -> None:
+    cfg = find_cfg()
+    cfg.need("agents")
+    feed = cfg.require("feed", "genome feed")
+    lines = read(feed).splitlines()
+    if args.since:
+        idx = next((i for i, l in enumerate(lines) if f"[{args.since}]" in l), None)
+        if idx is None:
+            die(f"--since {args.since}: no such feed id")
+        lines = lines[idx + 1:]
+    to = args.to.lstrip("@") if args.to else None
+    for ln in lines:
+        if (not args.workflow or f"wf:{args.workflow}" in ln) and (not to or f"@{to}" in ln or f"`{to}`" in ln):
+            print(ln)
+
+
+# ---------------------------------------------------------------- templates
+
+def genome_toml(mods: list[str], gate: str) -> str:
+    roles = [r for m in mods for r in MODULE_ROLES[m]]
+    out = ["# genome.toml — modules on, role → path map, module settings. Edit freely.",
+           "[genome]", f"modules = {json.dumps(mods)}", "", "[paths]"]
+    out += [f'{r} = "{DEFAULT_PATHS[r]}"' for r in roles]
+    out += ["", "[core]", f'gate = "{gate}"            # build/test gate run by `genome close`',
+            'worklog_form = "file"      # or "numbered" (worklog = a directory of NNNN-date-slug.md + INDEX.md)',
+            'archive_form = "flat"      # or "generations" (archive/<generation>/ + README manifest, no tombstones)',
+            "living_plans = []          # plans that evolve (phase rows, a 'Resume here' section)",
+            '# resume = "docs/plans/<living-plan>.md#Resume here"   # what `genome wake` shows',
+            "budgets = {}               # e.g. { \"AGENTS.md\" = 60000 } — bytes; entry surfaces stay cheap to read",
+            "emitters = []              # extra commands `genome close` runs to regenerate derived files",
+            "checklist = []             # judgement items `genome close` reminds you of",
+            "never_commit = []          # globs `genome close` leaves out of the named-path commit list"]
+    if "records" in mods:
+        out += ["", "[records]", 'prefix = ""                # e.g. "PQF" → PQF-AD-001',
+                'mode = "immutable"         # or "amendable" (dated ## Amendment sections)']
+    if "research" in mods:
+        out += ["", "[research]", f"classes = {json.dumps(list(CLASSES))}",
+                "surfaces = []              # globs where every figure needs a class (default: state + agents)"]
+    if "ops" in mods:
+        out += ["", "[ops]", "owner_globs = []           # doc locations that must be listed in the ownership map",
+                "link_surfaces = []         # docs whose backticked paths must exist",
+                "link_prefixes = []         # e.g. [\"docs/\", \"scripts/\"]: any backticked path starting so is checked, dirs too",
+                "code_globs = []            # code that must be reachable from a live surface",
+                "code_roots = []            # files whose mentions make code live (bin/, tests/, ...)",
+                'bulk_globs = ["*.parquet", "*.pkl", "*.npz"]', "max_bytes = 5000000",
+                'secrets = []               # e.g. [".env:API_KEY", "~/.config/x/token"] — scanned in diffs, never printed',
+                '# jobs = "bin/jobs status"   # shown by `genome wake`']
+    return "\n".join(out) + "\n"
+
+
+def agents_tpl(mods: list[str], gate: str) -> str:
+    rows_ = [("what is this / how to build / the rules (for agents)", "this file"),
+             ("what is this, how do I install and run it (for readers)", "`README.md`"),
+             ("how does it work, in depth (for readers)", "`docs/`"),
+             ("where does the project stand right now", "`docs/handoff/STATE.md`"),
+             ("what does a fresh agent read, in order", "`docs/handoff/README.md`"),
+             ("what is left to do, and what was decided about each item", "`TODO.md`"),
+             ("what did we ask the operator, and what did they rule", "`docs/kb/ASKS.md`"),
+             ("how will we do X (plans)", "`docs/plans/`"),
+             ("what was audited, what was found", "`docs/audit/`"),
+             ("what was tried and rejected — do not re-litigate", "`docs/kb/CLOSED.md`"),
+             ("exact commands, environment traps", "`docs/RUNBOOK.md`"),
+             ("what happened, session by session", "`docs/kb/WORKLOG.md`"),
+             ("superseded history", "`docs/archive/`")]
+    if "records" in mods:
+        rows_ += [("why X is the way it is (decisions) / what bit us (regressions)", "`docs/RECORDS.md`")]
+    if "research" in mods:
+        rows_ += [("which hypotheses were tested, and their verdicts", "`docs/kb/HYPOTHESES.md`"),
+                  ("which figures must never be quoted again", "`docs/kb/QUARANTINE.md`"),
+                  ("which confirmatory tests were frozen before running", "`docs/kb/PREREG.md`"),
+                  ("where the measured numbers live", "`evidence/README.md`")]
+    if "ops" in mods:
+        rows_ += [("which doc owns which question (ownership map)", "`docs/INDEX.md`")]
+    if "agents" in mods:
+        rows_ += [("cross-agent messages, claims, mentions", "`docs/kb/feed.md`"),
+                  ("in-flight work per workflow", "`docs/kb/workflows/`")]
+    table = "\n".join(f"| {q} | {a} |" for q, a in rows_)
+    return f"""# AGENTS.md — the entry contract
+
+Orientation, the gate, and **which document owns which question**.
+Start every session with `genome wake`; find an answer with `genome ask "<question>"`;
+end every iteration with `genome close`.
+
+## What this project is
+
+(one paragraph)
+
+## Gate
+
+```
+{gate or "(declare the build/test gate in genome.toml [core] gate)"}
+```
+
+## Routing table — which document answers what
+
+| question | answer lives in |
+|---|---|
+{table}
+
+## Rules
+
+1. One owner per question; amend the owner, never add a second.
+2. Every document has a mutability class; append-only files only gain lines.
+3. Nothing is deleted: superseded → `genome archive --reason`.
+4. Terminal states name their evidence; numbers cite the artefact they came from.
+5. Operator feedback amends its owner doc or record in the same session (`genome q rule ... --applied`).
+"""
+
+
+REGISTER_TPL = """# TODO — the register
+
+One row per work item; rows update in place, verdicts append — never delete.
+`genome status <id> <state> --evidence <path>` is the supervised transition.
+
+| id | status | item / verdict | notes |
+|---|---|---|---|
+"""
+ENTRY_TPL = """# Entry — what a fresh agent does, in order
+
+1. `genome wake` — state, resume point, operator questions, jobs, health in one call.
+2. `genome ask "<question>"` — the one section that answers it; read that range only.
+3. Before work that touches a decision: `genome rec recon <keywords>` (prior art).
+4. End of iteration: `genome close`.
+
+**Stop and ask the operator** (record it with `genome q add`): (list the decisions that belong to them)
+"""
+STATE_TPL = """# State
+
+Current snapshot only (no history: that is the worklog). The first `## ` block is
+what `genome wake` shows.
+
+## State — (date)
+"""
+RUNBOOK_TPL = "# Runbook — exact commands, environment traps\n\n| task | command | traps |\n|---|---|---|\n"
+CLOSED_TPL = """# CLOSED — tried and rejected
+
+Append-only. An entry names the item, the verdict, the measurement that killed it
+(a path), and the re-open condition. Re-proposing needs new evidence.
+"""
+WORKLOG_TPL = "# Worklog\n\nAppend-only: `genome log \"<entry>\"`, one per unit of work.\n"
+ASKS_TPL = """# Operator questions and rulings
+
+`genome q add "<question>"` · `genome q rule Q1 "<ruling>" --applied <owner path>`.
+A ruling is done only when its owner doc or record carries it.
+
+| id | asked | status | question | ruling | applied |
+|---|---|---|---|---|---|
+"""
+RECORDS_TPL = """# Records — decisions (AD) and regressions (RG)
+
+Generated zones below are written by `genome rec emit`; never hand-edit them.
+Topic → governing record notes go above the zones.
+"""
+HYP_TPL = """# Hypotheses — what was tested, and what was found
+
+`genome hyp add "<hypothesis>"` · `genome hyp verdict H1 rejected --evidence <path> --reopen "<condition>"`.
+Statuses: open testing accepted rejected parked. A rejection names what would re-open it.
+
+| id | status | hypothesis | verdict | reopen-if |
+|---|---|---|---|---|
+"""
+QUAR_TPL = """# Quarantine — figures that must never be quoted as current
+
+Backtick each figure exactly as it appears; `genome lint` fails when one reappears on a surface.
+
+| figures | where they appeared | why invalid | invalidating record | date |
+|---|---|---|---|---|
+"""
+PREREG_TPL = """# Pre-registrations — confirmatory specs frozen before the run
+
+`genome prereg freeze <spec>` records the hash; lint fails if the spec changes afterwards.
+
+| date | spec | sha256 | head | note |
+|---|---|---|---|---|
+"""
+EVIDENCE_TPL = """# Evidence store
+
+Numbers are written here by tools, never by hand. Docs cite a file path, not a
+transcribed value. Each artefact names its run, inputs and code version.
+"""
+MAP_TPL = """# Ownership map — every active doc, the question it owns, its status
+
+Status: LIVE (current truth) · EVIDENCE (dated measured verdict) · PLAN-ACTIVE.
+
+| File | Status | Owns | Not for |
+|---|---|---|---|
+"""
+FEED_TPL = """# Agent feed
+
+Append-only. `genome post "msg" --wf <wf> --to <agent>`; `genome feed --to <you>`.
+"""
+WF_TPL = """# Workflow: {{WF}}
+
+`genome wf add {{WF}} "item"`, `genome claim <id>`, `genome done <id> done --evidence <path>`.
+
+| id | status | item | claim | verdict |
+|---|---|---|---|---|
+"""
+PLAN_TPL = """# {{TITLE}}
+
+Dated-frozen: published `{{DATE}}`. A plan that changes is a new plan (or declare it
+in genome.toml `core.living_plans` and keep a 'Resume here' section).
+
+## Mechanism
+
+## Gates / success criteria
+
+(fixed before the run)
+
+## Cost
+"""
+AUDIT_TPL = """# {{TITLE}}
+
+Dated-frozen: audited `{{DATE}}`; findings mark verified vs asserted.
+
+## Scope
+
+## Findings
+
+- **[verified/asserted]** finding — evidence or basis
+"""
+AD_BODY = """# {{ID}}: {{TITLE}}
+
+{{MODE}}
+
+## Context
+
+## Decision
+
+## Consequences
+"""
+RG_BODY = """# {{ID}}: {{TITLE}}
+
+{{MODE}}
+
+## Symptom
+
+## Root cause
+
+## Law
+
+## Detection
+"""
+
+
+# ---------------------------------------------------------------- main
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="genome", description=__doc__.splitlines()[0])
+    p.add_argument("--version", action="version", version=f"genome {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, help_, *aliases):
+        s = sub.add_parser(name, help=help_, aliases=list(aliases))
+        s.set_defaults(fn=fn)
+        return s
+
+    s = add("init", cmd_init, "scaffold the genome (never overwrites)")
+    s.add_argument("--profile", choices=PROFILES)
+    s.add_argument("--modules", help="comma list, e.g. records,research")
+    s.add_argument("--force", action="store_true")
+    add("modules", cmd_modules, "show which modules are on")
+    s = add("lint", cmd_lint, "check every enabled module (exit 2 on error)")
+    s.add_argument("--advisory", action="store_true")
+    s.add_argument("--only", choices=MODULES)
+    s.add_argument("--code", nargs="+", help="only these codes, e.g. E303 W007")
+    s.add_argument("--all", action="store_true", help="print every finding (default: 5 per code)")
+    add("doctor", cmd_doctor, "staleness, append-only violations, unapplied rulings, running-job edits")
+    add("emit", cmd_emit, "regenerate every genome zone (records, ID map, worklog index); close does this too")
+    add("wake", cmd_wake, "one-call orientation: state, resume, asks, jobs, inbox, health")
+    s = add("ask", cmd_ask, "question → the owning sections (path:lines)")
+    s.add_argument("question", nargs="+")
+    s.add_argument("--k", type=int, default=6)
+    s.add_argument("--show", type=int, nargs="?", const=60, default=0, help="print the best section (N lines)")
+    s = add("close", cmd_close, "iteration close: emit, lint, secrets, gate, named paths")
+    s.add_argument("--no-gate", action="store_true")
+    s = add("handoff", cmd_handoff, "generate a state snapshot from git + register + worklog")
+    s.add_argument("--write", action="store_true")
+    s = add("status", cmd_status, "supervised register transition")
+    s.add_argument("id"); s.add_argument("status")
+    s.add_argument("--evidence"); s.add_argument("--note"); s.add_argument("--agent")
+    s = add("plan", lambda a: cmd_plan(a, "plans"), "mint a dated plan")
+    s.add_argument("title")
+    s = add("audit", lambda a: cmd_plan(a, "audits"), "mint a dated audit")
+    s.add_argument("title")
+    s = add("archive", cmd_archive, "archive a doc (or one --section of it) with a reason")
+    s.add_argument("path"); s.add_argument("--reason", required=True)
+    s.add_argument("--section"); s.add_argument("--generation"); s.add_argument("--by")
+    s = add("log", cmd_log, "worklog: append an entry (file form) or create the next numbered file")
+    s.add_argument("entry"); s.add_argument("--body"); s.add_argument("--agent")
+    s.add_argument("--body-file", help="the entry body from a markdown file (`-` = stdin)")
+    s = add("q", cmd_q, "operator questions: add | rule | apply | withdraw | list")
+    s.add_argument("q_cmd", choices=["add", "rule", "apply", "withdraw", "list"])
+    s.add_argument("id", nargs="?"); s.add_argument("text", nargs="*")
+    s.add_argument("--applied", nargs="+"); s.add_argument("--open", action="store_true")
+
+    s = add("rec", cmd_rec, "records: recon | new | amend | supersede | merge | retire | list | show | emit")
+    rs = s.add_subparsers(dest="rec_cmd", required=True)
+    r = rs.add_parser("recon"); r.add_argument("keywords", nargs="+")
+    r = rs.add_parser("new"); r.add_argument("kind", choices=["ad", "rg", "AD", "RG"]); r.add_argument("title")
+    r.add_argument("--recon", required=True); r.add_argument("--orthogonal", required=True)
+    r.add_argument("--description"); r.add_argument("--severity", default="High")
+    r = rs.add_parser("amend"); r.add_argument("id"); r.add_argument("--title", required=True)
+    r.add_argument("--reason", required=True); r.add_argument("--body"); r.add_argument("--body-file")
+    r.add_argument("--set", nargs="+", metavar="FIELD=VALUE")
+    r = rs.add_parser("supersede"); r.add_argument("ids", nargs=1); r.add_argument("--by", required=True)
+    r.add_argument("--reason", required=True)
+    r = rs.add_parser("merge"); r.add_argument("ids", nargs="+"); r.add_argument("--into", dest="by", required=True)
+    r.add_argument("--reason", required=True)
+    r = rs.add_parser("retire"); r.add_argument("ids", nargs="+"); r.add_argument("--reason", required=True)
+    r = rs.add_parser("list"); r.add_argument("--all", action="store_true")
+    r = rs.add_parser("show"); r.add_argument("id"); r.add_argument("--lines", type=int, default=40)
+    rs.add_parser("emit")
+    # legacy kb aliases: `ad "<title>"` / `rg "<title>"` → recon-free mint is gone; point at the gate
+    for kind in ("ad", "rg"):
+        s = add(kind, lambda a, k=kind: die(f"`{k}` is now `genome rec recon <kw>` then `genome rec new {k} ...`"),
+                f"(moved) use `rec new {kind}`")
+        s.add_argument("title", nargs="*")
+
+    s = add("figure", cmd_figure, "every live occurrence of a figure (propagation check)")
+    s.add_argument("value")
+    s = add("quarantine", cmd_quarantine, "register invalidated figures and list where to strike them")
+    s.add_argument("figures", nargs="+"); s.add_argument("--why", required=True)
+    s.add_argument("--where"); s.add_argument("--by")
+    s = add("hyp", cmd_hyp, "hypotheses: add | verdict | list")
+    s.add_argument("hyp_cmd", choices=["add", "verdict", "list"])
+    s.add_argument("id", nargs="?"); s.add_argument("text", nargs="*")
+    s.add_argument("--status"); s.add_argument("--evidence"); s.add_argument("--reopen")
+    s.add_argument("--note"); s.add_argument("--open", action="store_true")
+    s = add("prereg", cmd_prereg, "pre-registrations: freeze <spec> | check")
+    s.add_argument("pr_cmd", choices=["freeze", "check"]); s.add_argument("spec", nargs="?")
+    s.add_argument("--reason"); s.add_argument("--note")
+    s.add_argument("--at", help="freeze the spec as committed at this ref (backfilling a pre-registration)")
+    add("secrets", cmd_secrets, "scan staged+unstaged diffs for configured secret values")
+
+    s = add("wf", cmd_wf, "workflow boards: new | add | list")
+    s.add_argument("wf_cmd", choices=["new", "add", "list"]); s.add_argument("name", nargs="?")
+    s.add_argument("item", nargs="?")
+    s = add("claim", cmd_claim, "claim a board item")
+    s.add_argument("item"); s.add_argument("--agent"); s.add_argument("--workflow")
+    s = add("done", cmd_done, "move a board item")
+    s.add_argument("item"); s.add_argument("new_status", choices=STATUS_VOCAB)
+    s.add_argument("--evidence"); s.add_argument("--note"); s.add_argument("--agent"); s.add_argument("--workflow")
+    s = add("claim-register", cmd_claim_register, "claim a register row")
+    s.add_argument("id"); s.add_argument("--agent")
+    s = add("post", cmd_post, "post to the agent feed")
+    s.add_argument("message"); s.add_argument("--wf", dest="workflow"); s.add_argument("--to")
+    s.add_argument("--reply"); s.add_argument("--agent")
+    s = add("feed", cmd_feed, "read the feed (your mentions)")
+    s.add_argument("--wf", dest="workflow"); s.add_argument("--to"); s.add_argument("--since")
+
+    args = p.parse_args()
+    if args.cmd == "hyp" and args.hyp_cmd == "verdict":
+        args.status = args.status or (args.text[0] if args.text else None)
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

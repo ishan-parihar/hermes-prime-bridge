@@ -1,0 +1,31 @@
+# genome.toml — modules on, role → path map, module settings. Edit freely.
+[genome]
+modules = ["core", "agents"]
+
+[paths]
+agents = "AGENTS.md"
+state = "docs/handoff/STATE.md"
+entry = "docs/handoff/README.md"
+register = "TODO.md"
+ledger = "docs/kb/CLOSED.md"
+worklog = "docs/kb/WORKLOG.md"
+asks = "docs/kb/ASKS.md"
+plans = "docs/plans"
+audits = "docs/audit"
+runbook = "docs/RUNBOOK.md"
+archive = "docs/archive"
+readme = "README.md"
+docs = "docs"
+feed = "docs/kb/feed.md"
+workflows = "docs/kb/workflows"
+
+[core]
+gate = "uv run pytest"
+worklog_form = "file"      # or "numbered" (worklog = a directory of NNNN-date-slug.md + INDEX.md)
+archive_form = "flat"      # or "generations" (archive/<generation>/ + README manifest, no tombstones)
+living_plans = []          # plans that evolve (phase rows, a 'Resume here' section)
+# resume = "docs/plans/<living-plan>.md#Resume here"   # what `genome wake` shows
+budgets = {}               # e.g. { "AGENTS.md" = 60000 } — bytes; entry surfaces stay cheap to read
+emitters = []              # extra commands `genome close` runs to regenerate derived files
+checklist = []             # judgement items `genome close` reminds you of
+never_commit = []          # globs `genome close` leaves out of the named-path commit list
