@@ -1,5 +1,6 @@
 # genome.toml — modules on, role → path map, module settings. Edit freely.
 [genome]
+schema_version = 2
 modules = ["core", "agents"]
 
 [paths]
