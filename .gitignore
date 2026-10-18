@@ -16,3 +16,4 @@ build/
 .sisyphus/
 .oh-my-opencode/
 .history/
+.ruff_cache/
