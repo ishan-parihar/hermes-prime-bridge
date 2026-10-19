@@ -73,18 +73,19 @@ The rule, per layer:
 **One command** — install from any machine that has `curl` and `git`:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ishan-parihar/hermes-prime-bridge/main/scripts/install.sh) \
-  https://github.com/ishan-parihar/hermes-prime-bridge.git
+curl -fsSL https://raw.githubusercontent.com/ishan-parihar/hermes-prime-bridge/main/scripts/install.sh | bash -s --
 ```
 
 The installer finds Hermes home, clones the bridge — **with its live submodule** — into `~/.hermes/plugins/hermes-prime-bridge/`, enables it, and confirms with `hermes doctor`. No repo checkout required on the target host.
+
+> **Security:** the one-liner above clones the **canonical** repo by default — no untrusted argument is passed. To install from a different source, add `--allow-source <url>` (an explicit opt-in flag; the installer does not verify git signatures). See `scripts/install.sh --help`.
 
 Prefer the source over the script? Clone with the submodule and run the installer from it:
 
 ```bash
 git clone --recurse-submodules https://github.com/ishan-parihar/hermes-prime-bridge.git
 cd hermes-prime-bridge
-./scripts/install.sh
+./scripts/install.sh --allow-source "$(pwd)"
 ```
 
 Verify it is live:
