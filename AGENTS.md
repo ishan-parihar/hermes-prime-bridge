@@ -28,7 +28,7 @@ uv run pytest
 | how will we do X (plans) | `docs/plans/` |
 | what was audited, what was found | `docs/audit/` |
 | what was tried and rejected — do not re-litigate | `docs/kb/CLOSED.md` |
-| exact commands, environment traps | `docs/RUNBOOK.md` |
+| exact commands, environment traps | `AGENTS.md` § Gate |
 | what happened, session by session | `docs/kb/WORKLOG.md` |
 | superseded history | `docs/archive/` |
 | cross-agent messages, claims, mentions | `docs/kb/feed.md` |
