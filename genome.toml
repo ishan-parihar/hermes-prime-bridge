@@ -30,3 +30,6 @@ budgets = {}               # e.g. { "AGENTS.md" = 60000 } — bytes; entry surfa
 emitters = []              # extra commands `genome close` runs to regenerate derived files
 checklist = []             # judgement items `genome close` reminds you of
 never_commit = []          # globs `genome close` leaves out of the named-path commit list
+
+[card]
+architecture = "AGENTS.md"
