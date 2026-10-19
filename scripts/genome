@@ -112,7 +112,7 @@ TOMBSTONE = re.compile(r"<!--\s*kb: tombstone target=\"([^\"]+)\"")
 ZONE_RE = re.compile(r"<!-- genome:zone (\S+) sha=([0-9a-f]+) -->\n(.*?)<!-- genome:end \1 -->", re.S)
 ERR = 2
 MIN_CHUNK = 5  # lines; `ask` hits narrower than this point at a lead line without its content
-VERSION = "2026.10.19-4"
+VERSION = "2026.10.20-1"
 # every key genome reads: an unknown key is a typo that would silently switch a check off (E017)
 CONFIG_KEYS = {
     "genome": {"modules", "schema_version"},
@@ -1476,6 +1476,8 @@ def misplaced_paths(cfg) -> list[str]:
     for f in sh(cfg.root, "git", "ls-files", "-co", "--exclude-standard", "-z").split("\0"):
         if not f or "/" in f:
             continue
+        if not (cfg.root / f).is_file():
+            continue    # a staged deletion is not a file in the wrong place
         name = f.rsplit("/", 1)[-1]
         if name.startswith(".") or name in legal:
             continue
@@ -1509,25 +1511,12 @@ def legal_root_files(cfg) -> set[str]:
 def lint_root_placement(cfg: Cfg) -> list[str]:
     """A file may only live where a role points at.
 
-    Config-free: the legal set is derived from the role map, so this runs on
-    every repo. With the derived set only documents are candidates — a
-    Cargo.toml, a LICENSE and a genome.toml are the repo's own machinery, and
-    flagging them would train the agent to ignore the check. With an explicit
-    ops.root_files the rule is the strict allow-list it has always been.
+    One source of truth: `misplaced_paths` decides, this reports. The lint and
+    `close` must agree — a file the lint calls misplaced and a file `close`
+    refuses to name for commit are the same set, or the lint is advisory.
     """
-    out = []
-    legal = legal_root_files(cfg)
-    derived = cfg.get("ops", "root_files") is None
-    for f in sh(cfg.root, "git", "ls-files", "-co", "--exclude-standard", "-z").split("\0"):
-        if not f or "/" in f:
-            continue
-        name = f.rsplit("/", 1)[-1]
-        if name.startswith(".") or name in legal:
-            continue
-        if derived and not name.lower().endswith((".md", ".markdown")):
-            continue
-        out.append(f"E306 {f}: no role points here — move it under docs/, or give it a role")
-    return out
+    return [f"E306 {f}: no role points here — move it under docs/, or give it a role"
+            for f in misplaced_paths(cfg)]
 
 
 def lint_layout(cfg: Cfg) -> list[str]:
@@ -1539,14 +1528,15 @@ def lint_layout(cfg: Cfg) -> list[str]:
     # runs on every repo. the ops-only checks stay gated on their keys.
     if not (suf or req or stale):
         return lint_root_placement(cfg)
+    # and it runs even when the ops-only checks do: the placement findings
+    # come from the same function `close` uses, so the two can never disagree
+    out += lint_root_placement(cfg)
     files = [f for f in sh(cfg.root, "git", "ls-files", "-co", "--exclude-standard", "-z").split("\0") if f]
     files = [f for f in files if (cfg.root / f).is_file()]
     for f in files:
         name = f.rsplit("/", 1)[-1]
         if "truncated" in name or name.startswith("..."):
             out.append(f"E306 {f}: named like a truncation artefact")
-        if roots is not None and "/" not in f and not name.startswith(".") and name not in roots:
-            out.append(f"E306 {f}: no role points here — move it under docs/, or give it a role")
         key = max((d for d in suf if f.startswith(d.rstrip("/") + "/")), key=len, default=None)
         if key is not None and suf[key] != "*" and not f.endswith(tuple(suf[key])):
             out.append(f"E306 {f}: suffix not allowed under {key} ({', '.join(suf[key])})")
