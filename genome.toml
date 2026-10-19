@@ -33,6 +33,7 @@ never_commit = []          # globs `genome close` leaves out of the named-path c
 
 [card]
 architecture = "AGENTS.md"
+status_into = "docs/handoff/STATE.md"
 
 [drift]
 warn_until = "2026-11-18"  # warn until rollout+30d; after it a stale manual blocks close
