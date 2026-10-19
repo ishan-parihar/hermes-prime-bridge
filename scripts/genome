@@ -112,12 +112,12 @@ TOMBSTONE = re.compile(r"<!--\s*kb: tombstone target=\"([^\"]+)\"")
 ZONE_RE = re.compile(r"<!-- genome:zone (\S+) sha=([0-9a-f]+) -->\n(.*?)<!-- genome:end \1 -->", re.S)
 ERR = 2
 MIN_CHUNK = 5  # lines; `ask` hits narrower than this point at a lead line without its content
-VERSION = "2026.10.19-3"
+VERSION = "2026.10.19-4"
 # every key genome reads: an unknown key is a typo that would silently switch a check off (E017)
 CONFIG_KEYS = {
     "genome": {"modules", "schema_version"},
     "card": {"intent", "architecture", "operate", "decisions", "status", "purpose", "privacy", "components", "status_into"},
-    "federation": {"repos", "cache", "status_into"},
+    "federation": {"repos", "cache", "status_into", "exclude"},
     "index": {"embed"},
     "drift": {"mode", "paths", "warn_until"},
     "core": {"append_window", "archive_form", "ask_days", "ask_globs", "ask_index", "budgets", "checklist", "dated_pattern",
@@ -2779,6 +2779,7 @@ def agents_tpl(mods: list[str], gate: str) -> str:
     rows_ = [("what is this / how to build / the rules (for agents)", "this file"),
              ("what is this, how do I install and run it (for readers)", "`README.md`"),
              ("how does it work, in depth (for readers)", "`docs/`"),
+             ("how the pieces fit together (the architecture)", "this file § Architecture"),
              ("where does the project stand right now", "`docs/handoff/STATE.md`"),
              ("what does a fresh agent read, in order", "`docs/handoff/README.md`"),
              ("what is left to do, and what was decided about each item", "`TODO.md`"),
@@ -2811,6 +2812,11 @@ end every iteration with `genome close`.
 ## What this project is
 
 (one paragraph)
+
+## Architecture
+
+(how the pieces fit together: the parts, what each is for, and how they connect.
+The card's `architecture` class points here until a repo names a different owner.)
 
 ## Gate
 
@@ -4261,13 +4267,56 @@ def cards_dir(cfg: Cfg | None = None) -> Path:
     return Path(v).expanduser()
 
 
+ROLE_FORMS = ("overlay:", "native:")
+
+CLASS_ROLES = {
+    "intent": "readme",
+    "operate": "runbook",
+    "decisions": "records_index",
+    "status": "state",
+}
+# a class with no role of its own falls back to the agent contract, which every repo has:
+# the intent is what it says it is, the architecture is how it says it is built
+CLASS_FALLBACK = {"intent": ("agents", ""), "architecture": ("agents", "Architecture")}
+
+
+def role_form_path(cfg: Cfg, raw: str) -> str:
+    """The file a role form names, when it names one this repo actually has.
+
+    A role may be written as `overlay:<path>` or `native:<path>` to say the answer
+    lives outside the distributed tree, or `native:<prose>` when the answer is a
+    description rather than a file. Only the file form resolves to a doc; a prose
+    form resolves to nothing, and the class stays empty because there is no
+    document to point at.
+    """
+    for prefix in ROLE_FORMS:
+        if not raw.startswith(prefix):
+            continue
+        tail = raw[len(prefix):].split(" ", 1)[0].strip()
+        if tail and (cfg.root / tail).exists():
+            return tail
+        return ""
+    return raw
+
+
 def card_class_path(cfg: Cfg, cls: str) -> str:
     """Where a doc class lives: [card] override, else the role that answers it."""
     v = cfg.get("card", cls)
     if v:
         return v
-    role = {"intent": "readme", "operate": "runbook", "decisions": "records_index", "status": "state"}.get(cls)
-    return cfg.paths[role] if role and cfg.has(role) else ""
+    role = CLASS_ROLES.get(cls)
+    if role and role in cfg.paths:
+        raw = cfg.paths[role]
+        if raw.startswith(ROLE_FORMS):        # a role form names a doc this repo may hold
+            return role_form_path(cfg, raw)
+        if (cfg.root / raw.split("#", 1)[0]).exists():
+            return raw
+    fb = CLASS_FALLBACK.get(cls)
+    if fb and fb[0] in cfg.paths:
+        raw = cfg.paths[fb[0]]
+        if not raw.startswith(ROLE_FORMS) and (cfg.root / raw.split("#", 1)[0]).exists():
+            return f"{raw}#{fb[1]}" if fb[1] else raw
+    return ""
 
 
 def head_sha(cfg: Cfg, short: bool = True) -> str:
@@ -4440,11 +4489,19 @@ def cmd_card(args) -> None:
 
 
 def federation_repos(cfg: Cfg) -> list[Path]:
+    """The federation's members: every directory the globs reach that holds a genome,
+    minus the ones the operator excludes by name.
+
+    Membership would otherwise be an accident of how deep a directory sits: a glob
+    that reaches one level too deep also reaches a fixture. `[federation] exclude`
+    names the directories to skip, so membership is a decision.
+    """
     seen = []
+    skip = set(cfg.get("federation", "exclude", []))
     for g in cfg.get("federation", "repos", ["*", "*/*"]):
         for d in sorted(cfg.root.glob(g)):
             if d.is_dir() and d != cfg.root and (d / "genome.toml").is_file() and d not in seen \
-                    and not any(x in d.relative_to(cfg.root).parts for x in HEAVY_DIRS):
+                    and not any(x in d.relative_to(cfg.root).parts for x in HEAVY_DIRS | skip):
                 seen.append(d)
     return seen
 
