@@ -130,6 +130,15 @@ CONFIG_KEYS = {
             "dir_requires", "stale_terms", "stale_exempt", "external_ok"},
 }
 STALE_DOCS = ("*.md", "*.yaml", "*.yml", "*.toml", "*.txt", "*.rst")  # stale paths matter where people read
+# The root files an ordinary software repo carries, and that no role points at.
+# Each is an ecosystem convention, not a genome role: a repo that keeps one
+# keeps it for the same reason every other repo does.
+CONVENTIONAL_ROOT_DOCS = {
+    "AGENTS.md", "CLAUDE.md", "README.md", "TODO.md",
+    "CONTRIBUTING.md", "CHANGELOG.md", "SECURITY.md", "CODE_OF_CONDUCT.md",
+    "GOVERNANCE.md", "MAINTAINERS.md", "SUPPORT.md", "AUTHORS.md",
+    "NOTICE.md", "SKILL.md",
+}
 SEVERITIES = ("Critical", "High", "Medium", "Low")
 STOP = set("the and for what where which how does did are was were this that with from into when who why "
            "should can its it's our your about have has not any all in is it of on or to we an as at by do if "
@@ -1038,6 +1047,7 @@ def cmd_ask(args) -> None:
 def lint_core(cfg: Cfg) -> list[str]:
     out: list[str] = [f"E017 genome.toml: unknown key {k} (a typo here switches a check off silently)"
                       for k in cfg.unknown]
+    out += lint_layout(cfg)   # root placement is a core invariant, not an ops option
     out += [f"W507 [paths] {k} is retired (no role uses it); `genome migrate` removes it" for k in RETIRED_PATHS
             if k in cfg.declared]
     if cfg.schema_version < 2:  # the one-dialect change: say what `genome migrate` will rewrite
@@ -1417,7 +1427,7 @@ def lint_ops(cfg: Cfg) -> list[str]:
                 todo |= refs(f) - seen
         out += [f"E304 {f} is reachable from no live surface — archive it or cite it from its owner" for f in
                 sorted(set(code) - seen)]
-    out += lint_layout(cfg) + lint_external(cfg)
+    out += lint_external(cfg)
     # tracked bulk
     bulk, big = cfg.get("ops", "bulk_globs", []), cfg.get("ops", "max_bytes", 0)
     allow = set(cfg.get("ops", "bulk_allow", []))
@@ -1452,13 +1462,83 @@ def lint_external(cfg: Cfg) -> list[str]:
     return out
 
 
+def misplaced_paths(cfg) -> list[str]:
+    """Root files that no role points at.
+
+    With an explicit ops.root_files the rule is the strict allow-list it has
+    always been. With the derived default the rule is scoped to documents,
+    because a Cargo.toml, a LICENSE and a genome.toml are the repo's own
+    machinery and flagging them would train the agent to ignore the check.
+    """
+    legal = legal_root_files(cfg)
+    derived = cfg.get("ops", "root_files") is None
+    out = []
+    for f in sh(cfg.root, "git", "ls-files", "-co", "--exclude-standard", "-z").split("\0"):
+        if not f or "/" in f:
+            continue
+        name = f.rsplit("/", 1)[-1]
+        if name.startswith(".") or name in legal:
+            continue
+        if derived and not name.lower().endswith((".md", ".markdown")):
+            continue
+        out.append(f)
+    return sorted(out)
+
+
+def legal_root_files(cfg) -> set[str]:
+    """The root-level files this repo may have.
+
+    Derived when the repo has not said otherwise: the conventional root docs
+    plus every role this repo has moved to the root. ops.root_files, when set,
+    REPLACES the derived set, so an existing config keeps exactly the behaviour
+    it was written for.
+    """
+    explicit = cfg.get("ops", "root_files")
+    if explicit is not None:
+        return set(explicit)
+    out = set(CONVENTIONAL_ROOT_DOCS)
+    for role in cfg.paths:
+        if cfg.form(role)[0] != "file":
+            continue
+        p = cfg.paths[role].split("#", 1)[0]
+        if "/" not in p:
+            out.add(p)
+    return out
+
+
+def lint_root_placement(cfg: Cfg) -> list[str]:
+    """A file may only live where a role points at.
+
+    Config-free: the legal set is derived from the role map, so this runs on
+    every repo. With the derived set only documents are candidates — a
+    Cargo.toml, a LICENSE and a genome.toml are the repo's own machinery, and
+    flagging them would train the agent to ignore the check. With an explicit
+    ops.root_files the rule is the strict allow-list it has always been.
+    """
+    out = []
+    legal = legal_root_files(cfg)
+    derived = cfg.get("ops", "root_files") is None
+    for f in sh(cfg.root, "git", "ls-files", "-co", "--exclude-standard", "-z").split("\0"):
+        if not f or "/" in f:
+            continue
+        name = f.rsplit("/", 1)[-1]
+        if name.startswith(".") or name in legal:
+            continue
+        if derived and not name.lower().endswith((".md", ".markdown")):
+            continue
+        out.append(f"E306 {f}: no role points here — move it under docs/, or give it a role")
+    return out
+
+
 def lint_layout(cfg: Cfg) -> list[str]:
     """Where files may live: root allow-list, per-directory suffixes, required per-directory files, stale terms."""
     out = []
     roots, suf = cfg.get("ops", "root_files"), cfg.get("ops", "dir_suffixes", {})
     req, stale = cfg.get("ops", "dir_requires", {}), cfg.get("ops", "stale_terms", [])
-    if not (roots or suf or req or stale):
-        return out
+    # the root-placement check needs no config: the legal set is derived, so it
+    # runs on every repo. the ops-only checks stay gated on their keys.
+    if not (suf or req or stale):
+        return lint_root_placement(cfg)
     files = [f for f in sh(cfg.root, "git", "ls-files", "-co", "--exclude-standard", "-z").split("\0") if f]
     files = [f for f in files if (cfg.root / f).is_file()]
     for f in files:
@@ -1466,7 +1546,7 @@ def lint_layout(cfg: Cfg) -> list[str]:
         if "truncated" in name or name.startswith("..."):
             out.append(f"E306 {f}: named like a truncation artefact")
         if roots is not None and "/" not in f and not name.startswith(".") and name not in roots:
-            out.append(f"E306 {f}: not in ops.root_files (root litter)")
+            out.append(f"E306 {f}: no role points here — move it under docs/, or give it a role")
         key = max((d for d in suf if f.startswith(d.rstrip("/") + "/")), key=len, default=None)
         if key is not None and suf[key] != "*" and not f.endswith(tuple(suf[key])):
             out.append(f"E306 {f}: suffix not allowed under {key} ({', '.join(suf[key])})")
@@ -1960,6 +2040,10 @@ def cmd_close(args) -> None:
     staged_gone = {p for st, p in changed_paths(cfg) if st == "D "}  # `git add` on it fails the whole line
     named = [p for p in paths if not any(gmatch(p, g, cfg) for g in never) and not p.startswith(".genome/")
              and p not in staged_gone]
+    # a path the layout check rejects is never named for commit: the tooling
+    # must not produce the litter it is reporting
+    misplaced = set(misplaced_paths(cfg))
+    named = [p for p in named if p not in misplaced]
     print("\njudgement ([x] checked here, [?] yours to confirm):")
     checks = []
     if cfg.has("state"):
@@ -1982,6 +2066,11 @@ def cmd_close(args) -> None:
         checks.append((item, None))
     for text, ok in checks:
         print(f"  [{'x' if ok else ' ' if ok is False else '?'}] {text}")
+    if misplaced:
+        print("\nnot committed — these are in no role's location:")
+        for p in sorted(misplaced):
+            print(f"  {p}")
+        print("  move it, or give it a role, then run close again")
     if named:
         shown = collapse_paths(named, [p for p in paths if p not in named]) if len(named) > 12 else named
         print("\ncommit named paths:\n  git add -- " + " ".join(shlex.quote(p) for p in shown))
