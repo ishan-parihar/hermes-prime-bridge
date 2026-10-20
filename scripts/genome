@@ -112,7 +112,7 @@ TOMBSTONE = re.compile(r"<!--\s*kb: tombstone target=\"([^\"]+)\"")
 ZONE_RE = re.compile(r"<!-- genome:zone (\S+) sha=([0-9a-f]+) -->\n(.*?)<!-- genome:end \1 -->", re.S)
 ERR = 2
 MIN_CHUNK = 5  # lines; `ask` hits narrower than this point at a lead line without its content
-VERSION = "2026.10.20-1"
+VERSION = "2026.10.20-2"
 # every key genome reads: an unknown key is a typo that would silently switch a check off (E017)
 CONFIG_KEYS = {
     "genome": {"modules", "schema_version"},
@@ -4585,6 +4585,26 @@ def federation_repos(cfg: Cfg) -> list[Path]:
     return seen
 
 
+def prune_cards(cache: Path) -> list[str]:
+    """Delete the cards whose repo is gone: a card for a directory that no longer exists keeps
+    answering questions and outranks the live repos it was meant to point at.
+
+    Only a card whose recorded `root` is missing is removed; a card whose root exists is left
+    alone even if the repo is no longer a member (it may be excluded, or a peer may still hold it).
+    """
+    gone = []
+    for p in sorted(cache.glob("*.json")):
+        try:
+            card = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        root = card.get("root")
+        if root and not Path(root).is_dir():
+            p.unlink()
+            gone.append(card.get("name") or p.stem)
+    return gone
+
+
 def cmd_federate(args) -> None:
     """Build every member's card into the cache (reading each tree, writing none) and refresh the portfolio zone."""
     cfg = find_cfg()
@@ -4606,6 +4626,7 @@ def cmd_federate(args) -> None:
             continue
         c = json.loads(out.read_text())
         rows_.append(c)
+    gone = prune_cards(cache)
     into = cfg.get("federation", "status_into")
     if into and rows_:
         body = "| repo | genome | lint | open items | purpose |\n|---|---|---|---|---|\n"
@@ -4615,7 +4636,8 @@ def cmd_federate(args) -> None:
                      f"{c['purpose'][:90].replace('|', '/')} |\n")
         path, _, zone = into.partition("#")
         write_zone(cfg.root / path, zone or "portfolio", body)
-    print(f"federate: {len(rows_)} card(s) in {cache}" + (f"; skipped {len(skipped)}" if skipped else ""))
+    print(f"federate: {len(rows_)} card(s) in {cache}" + (f"; skipped {len(skipped)}" if skipped else "")
+          + (f"; pruned {len(gone)} stale card(s): {', '.join(gone)}" if gone else ""))
     for s in skipped:
         print(f"  skipped {s}")
 
@@ -4625,9 +4647,73 @@ def load_cards(cfg: Cfg | None = None) -> list[dict]:
     return [json.loads(p.read_text()) for p in sorted(d.glob("*.json"))] if d.is_dir() else []
 
 
+# A question that names a doc class is answered with that class's document.
+#
+# Why this is needed: a routing row's own question text ("where does the project stand right now")
+# matches a natural-language question far better than a class heading does, and the routing row
+# scores 2.5 against the class headings' 1.5. So the federation answered "how is it built" with a
+# routing row instead of the architecture document the card already points at. The class map was
+# right and the ranking was answering something else. Routing is not weakened here; the class
+# question reaches the class.
+CLASS_INTENT_WORDS = {
+    "intent": {"purpose", "overview"},
+    "architecture": {"architectur", "built", "structur", "design", "component", "layout", "blueprint"},
+    "operate": {"run", "operat", "deploy", "install", "build", "test", "usag", "command", "setup", "configur"},
+    "decisions": {"decid", "ration", "reason", "choic", "chosen"},
+    "status": {"stand", "status", "stat", "progress", "today", "current"},
+}
+# the question words that are stop words in the tokenizer ("how", "why", "where") are matched as phrases
+CLASS_INTENT_PHRASES = {
+    "intent": ("what is", "what does", "what are"),
+    "architecture": ("how is", "how does", "how it works"),
+    "operate": ("how do i", "how to"),
+    "decisions": ("why was", "why is", "why did", "why were"),
+    "status": ("where does", "where is"),
+}
+# the order a tie is broken in: the more specific class wins, intent last
+CLASS_PRIORITY = ("architecture", "decisions", "status", "operate", "intent")
+
+
+def class_intent(question: str) -> str | None:
+    """The doc class a question names, or None when it names none.
+
+    "how is it built" names architecture, "why was it decided" names decisions, "where does it
+    stand" names status, "how do I run it" names operate, "what is this" names intent. A word
+    match counts double against a phrase match, so one specific word ("status") beats a generic
+    phrase ("what is"); a tie goes to the more specific class.
+    """
+    q = question.lower()
+    words = toks(question)
+    best, best_score = None, 0
+    for cls in CLASS_PRIORITY:
+        w = len(CLASS_INTENT_WORDS.get(cls, set()) & words)
+        p = sum(1 for ph in CLASS_INTENT_PHRASES.get(cls, ()) if re.search(r"\b" + re.escape(ph) + r"\b", q))
+        s = 2 * w + p
+        if s > best_score:
+            best, best_score = cls, s
+    return best
+
+
+def class_pointer(card: dict, cls: str) -> tuple[str, str]:
+    """Where a class's document is and what to call it: the path, plus the heading that anchors it."""
+    raw = card["classes"][cls]["path"]
+    path, _, anchor = raw.partition("#")
+    heads = card.get("headings", {}).get(cls) or []
+    if anchor:
+        for h, ln in heads:
+            if h.strip().lower() == anchor.strip().lower():
+                return f"{path}:{ln}", h
+    if heads:
+        return f"{path}:{heads[0][1]}", heads[0][0]
+    return path, path
+
+
 def cards_ask(question: str, k: int, cfg: Cfg | None = None) -> list[dict]:
     """Repos ranked by how many question terms their card covers (idf across repos, field-weighted), each with the
-    best-matching item as the pointer. Coverage beats repetition: a term found ten times counts once."""
+    best-matching item as the pointer. Coverage beats repetition: a term found ten times counts once.
+
+    A question that names a doc class is answered with that class's document, whatever the term
+    coverage says: the class map is what the portfolio indexed, so it is what the answer points at."""
     q = toks(question)
     cards = [c for c in load_cards(cfg) if c.get("privacy") != "local"]
     items: dict[str, list[tuple[float, set[str], str, str, str]]] = {}
@@ -4641,14 +4727,21 @@ def cards_ask(question: str, k: int, cfg: Cfg | None = None) -> list[dict]:
         items[c["name"]] = it
     df = {t: sum(any(t in x[1] for x in it) for it in items.values()) for t in q}
     n = max(len(cards), 1)
+    named = class_intent(question)
     hits = []
     for c in cards:
         it = items[c["name"]]
         score = sum(math.log(1 + n / (1 + df[t])) * max((w for w, ts, *_ in it if t in ts), default=0) for t in q)
         if score <= 0:
             continue
-        w, ts, cls, where, text = max(it, key=lambda x: (len(q & x[1]), x[0]))
-        hits.append({"score": round(score, 1), "repo": c["name"], "pointer": f"repo:{c['name']}#{cls if cls not in ('name',) else 'intent'}",
+        if named and c["classes"].get(named, {}).get("exists"):
+            cls = named
+            where, text = class_pointer(c, cls)
+        else:
+            w, ts, cls, where, text = max(it, key=lambda x: (len(q & x[1]), x[0]))
+            if cls == "name":
+                cls = "intent"
+        hits.append({"score": round(score, 1), "repo": c["name"], "pointer": f"repo:{c['name']}#{cls}",
                      "where": where, "match": text[:100], "head": c["head"], "built": c["built"]})
     return sorted(hits, key=lambda h: -h["score"])[:k]
 
