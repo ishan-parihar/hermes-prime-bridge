@@ -112,11 +112,11 @@ TOMBSTONE = re.compile(r"<!--\s*kb: tombstone target=\"([^\"]+)\"")
 ZONE_RE = re.compile(r"<!-- genome:zone (\S+) sha=([0-9a-f]+) -->\n(.*?)<!-- genome:end \1 -->", re.S)
 ERR = 2
 MIN_CHUNK = 5  # lines; `ask` hits narrower than this point at a lead line without its content
-VERSION = "2026.10.20-2"
+VERSION = "2026.10.21-1"
 # every key genome reads: an unknown key is a typo that would silently switch a check off (E017)
 CONFIG_KEYS = {
     "genome": {"modules", "schema_version"},
-    "card": {"intent", "architecture", "operate", "decisions", "status", "purpose", "privacy", "components", "status_into"},
+    "card": {"intent", "architecture", "operate", "decisions", "status", "offer", "purpose", "privacy", "components", "status_into"},
     "federation": {"repos", "cache", "status_into", "exclude"},
     "index": {"embed"},
     "drift": {"mode", "paths", "warn_until"},
@@ -4335,7 +4335,7 @@ def cmd_impact(args) -> None:
 # the meta root reads cards instead of walking repos. Nothing here writes into a peer repo.
 
 CARD_SCHEMA = 1
-CARD_CLASSES = ("intent", "architecture", "operate", "decisions", "status")
+CARD_CLASSES = ("intent", "architecture", "operate", "decisions", "status", "offer")
 CARD_BUDGET = 24_000  # bytes: a card must fit a session's context
 SECRET_SHAPES = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{20,}|\b(?:sk|pk|ghp|gho|glpat|xox[bap])[-_][A-Za-z0-9_-]{16,}|"
                            r"-----BEGIN [A-Z ]*PRIVATE KEY-----|\bAKIA[0-9A-Z]{16}\b")
@@ -4661,6 +4661,9 @@ CLASS_INTENT_WORDS = {
     "operate": {"run", "operat", "deploy", "install", "build", "test", "usag", "command", "setup", "configur"},
     "decisions": {"decid", "ration", "reason", "choic", "chosen"},
     "status": {"stand", "status", "stat", "progress", "today", "current"},
+    # the offer class is opt-in: no role, no fallback, so it resolves only where [card] offer points at a doc.
+    # Ventures carry no offers; the meta root points the class at its proof/evidence documents.
+    "offer": {"offer", "price", "pricing", "fee", "rate"},
 }
 # the question words that are stop words in the tokenizer ("how", "why", "where") are matched as phrases
 CLASS_INTENT_PHRASES = {
@@ -4669,9 +4672,10 @@ CLASS_INTENT_PHRASES = {
     "operate": ("how do i", "how to"),
     "decisions": ("why was", "why is", "why did", "why were"),
     "status": ("where does", "where is"),
+    "offer": ("what should we offer", "what should i offer", "what can we sell"),
 }
 # the order a tie is broken in: the more specific class wins, intent last
-CLASS_PRIORITY = ("architecture", "decisions", "status", "operate", "intent")
+CLASS_PRIORITY = ("offer", "architecture", "decisions", "status", "operate", "intent")
 
 
 def class_intent(question: str) -> str | None:
