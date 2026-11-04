@@ -152,7 +152,7 @@ ERR = 2
 MIN_CHUNK = 5  # lines; `ask` hits narrower than this point at a lead line without its content
 HUB_NODE_CAP = 3000  # nodes; above this `graph hubs` ranks by degree and says betweenness was not computed
 _TMP_SEQ = itertools.count()  # makes each atomic_write temp name unique within this process too
-VERSION = "2026.11.02-74"
+VERSION = "2026.11.02-75"
 # every key genome reads: an unknown key is a typo that would silently switch a check off (E017)
 CONFIG_KEYS = {
     "genome": {"modules", "schema_version"},
@@ -162,7 +162,7 @@ CONFIG_KEYS = {
     "drift": {"mode", "paths", "warn_until"},
     "core": {"append_window", "archive_form", "ask_days", "ask_globs", "ask_index", "budgets", "checklist", "dated_pattern",
              "emitters", "gate", "living_plans", "never_commit", "pointer_ignore", "resume", "resume_heading",
-             "resume_lines", "toc_lines", "wake_lines", "worklog_form", "worklog_index", "worklog_width"},
+             "resume_lines", "toc_lines", "vendored_cli_patch", "wake_lines", "worklog_form", "worklog_index", "worklog_width"},
     "records": {"archive", "mode", "prefix", "recon_hours", "width", "zones", "required", "governed_by"},
     "research": {"classes", "figure_pattern", "hyp_prefix", "hyp_statuses", "surfaces", "quarantine_surfaces"},
     "ops": {"bulk_allow", "bulk_globs", "code_globs", "code_roots", "jobs", "link_prefixes", "link_surfaces",
@@ -3708,7 +3708,7 @@ def _verify_against_shipped(rows: list) -> None:
     me = _file_version(Path(__file__).read_text())
     if _version_key(me) > _version_key(ref):
         ref = me
-    behind, unknown, tampered = [], [], []
+    behind, unknown, tampered, patched = [], [], [], []
     for r in rows:
         v = live[r["path"]]
         if v in ("missing", "none"):
@@ -3725,7 +3725,23 @@ def _verify_against_shipped(rows: list) -> None:
             # The fleet's whole premise is that a vendored copy is the released file,
             # so a copy that is not reported CORRUPTED is a copy the operator cannot
             # trust — and it would otherwise pass this check as clean.
-            tampered.append((r, v))
+            #
+            # EXCEPT when the repo DECLARES the divergence. Measured 2026-11-04:
+            # holon's vendored CLI differs from the -74 release by 127 lines, and the
+            # difference is the F1 rules (W00A/W00B) that upstream does not carry. That
+            # divergence was not damage: the -71-era vendor was byte-identical to the
+            # release AND carried ZERO F1 rules, because a re-vendor had wiped them. The
+            # divergence appeared exactly when the rules were restored (commit edb9018).
+            #
+            # So the one alarm whose implied remedy — re-vendor to match the release —
+            # would RE-BREAK the repo it names. The same sha comparison is called
+            # "local patch" by `upgrade` and by `federation swap`; verify calling it
+            # CORRUPTED was the same bytes with a contradictory label, and a gating
+            # one. A declared patch is reported, not failed.
+            if _declares_local_patch(Path(r["path"])):
+                patched.append((r, v))
+            else:
+                tampered.append((r, v))
     for r, v in behind:
         print(f"BEHIND  {r['kind']:8} {r['path']} — {v}, shipped is {ref}")
     for r, v in unknown:
@@ -3733,6 +3749,9 @@ def _verify_against_shipped(rows: list) -> None:
     for r, v in tampered:
         print(f"CORRUPTED {r['kind']:6} {r['path']} — claims {v} but its bytes differ from the release "
               f"(a hand-edit, a partial write, or the wrong restore)")
+    for r, v in patched:
+        print(f"PATCHED   {r['kind']:6} {r['path']} — claims {v} and its bytes differ from the release, "
+              f"as its genome.toml declares (a deliberate local patch; the release bytes would drop it)")
     # The fourth question, added 2026-11-02 after the census measured 68 of 85 rows at
     # the shipped bytes on disk and older bytes at HEAD: a copy can be CURRENT and still
     # be one `git restore` from a regression. Behind/tampered are about what the bytes
@@ -3760,9 +3779,40 @@ def _verify_against_shipped(rows: list) -> None:
               f"verify reads the disk, git holds the history, and only the owner knows which one is "
               f"authoritative")
     if not behind and not unknown and not tampered:
-        print(f"verify: all {len(rows)} registered install(s) at the shipped version {ref}")
+        if patched:
+            print(f"verify: all {len(rows)} registered install(s) at the shipped version {ref} "
+                  f"({len(patched)} carrying a declared local patch)")
+        else:
+            print(f"verify: all {len(rows)} registered install(s) at the shipped version {ref}")
         return
     die(f"{len(behind)} behind, {len(unknown)} unknown, {len(tampered)} corrupted (shipped {ref})", ERR)
+
+
+def _declares_local_patch(root: Path) -> bool:
+    """True when the repo DECLARES that its vendored CLI carries a local patch.
+
+    The declaration lives in the repo's own genome.toml, so the owner of the divergence
+    says so in the file the owner controls, and the check has a fact to read rather than
+    a guess. It is deliberately NOT inferred: an inferred "this looks intentional" would
+    make the alarm silent exactly where it matters, since corruption and an intentional
+    patch look identical on disk.
+
+    The key is `[core] vendored_cli_patch`, a string naming the reason (a repo's own
+    rules, or where the patch lives). An empty or absent value means "no declaration",
+    which is the default for every repo in the fleet.
+    """
+    for name in ("genome.toml", "kb.toml"):
+        f = root / name
+        if not f.is_file():
+            continue
+        try:
+            data = tomllib.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        val = (data.get("core") or {}).get("vendored_cli_patch")
+        if isinstance(val, str) and val.strip():
+            return True
+    return False
 
 
 def _release_ledger() -> dict[str, str]:
